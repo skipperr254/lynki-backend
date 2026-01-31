@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import random
 from typing import List, Dict, Any, Optional, Tuple
 from app.core.supabase import get_supabase
 from app.services.question_generator import QuestionGenerator
@@ -238,50 +239,60 @@ class QuizGenerationService:
     ) -> int:
         """
         Save generated questions and their options to database.
+        Shuffles option order to randomize correct answer position.
         Returns count of successfully saved questions.
         """
         saved_count = 0
-        
+
         for i, question in enumerate(questions):
             try:
-                # Insert question record
+                # Create a list of options with their original data
+                options_list = list(question.options)
+
+                # Shuffle the options to randomize correct answer position
+                random.shuffle(options_list)
+
+                # Find the new index of the correct answer after shuffling
+                correct_answer_index = next(
+                    new_idx for new_idx, opt in enumerate(options_list) if opt.is_correct
+                )
+
+                # Insert question record with the new correct answer index
                 question_response = self.supabase.table("questions").insert({
                     "quiz_id": quiz_id,
                     "question": question.question,
                     "options": [],  # Legacy field, keep empty
-                    "correct_answer": next(
-                        opt.option_index for opt in question.options if opt.is_correct
-                    ),
+                    "correct_answer": correct_answer_index,
                     "explanation": "",  # Legacy field, keep empty
                     "order_index": start_order_index + i,
                     "concept_id": question.concept_id,
                     "hint": question.hint,
                     "difficulty_level": question.difficulty_level
                 }).execute()  # type: ignore
-                
+
                 if not question_response.data or len(question_response.data) == 0:
                     logging.error(f"Failed to insert question: {question.question[:50]}")
                     continue
-                
+
                 question_id = question_response.data[0]["id"]  # type: ignore[index]
-                
-                # Insert question options
+
+                # Insert question options with new shuffled indices
                 options_data = [
                     {
                         "question_id": question_id,
                         "option_text": opt.option_text,
-                        "option_index": opt.option_index,
+                        "option_index": new_idx,  # Use new shuffled index
                         "is_correct": opt.is_correct,
                         "explanation": opt.explanation
                     }
-                    for opt in question.options
+                    for new_idx, opt in enumerate(options_list)
                 ]
-                
+
                 self.supabase.table("question_options").insert(options_data).execute()  # type: ignore
                 saved_count += 1
-                
+
             except Exception as e:
                 logging.error(f"Error saving question: {e}")
                 continue
-        
+
         return saved_count
