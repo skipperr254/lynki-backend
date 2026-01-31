@@ -1,13 +1,18 @@
 import json
 import logging
 import re
+import asyncio
 from typing import List, Dict, Any, Tuple
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, APITimeoutError, APIConnectionError
 from anthropic.types import TextBlock
 from app.core.config import get_settings
 from app.schemas.quiz import GeneratedQuestion, QuestionOption
 
 settings = get_settings()
+
+# Timeout configuration
+CLAUDE_TIMEOUT_SECONDS = 90  # 90 seconds for Sonnet question generation (more complex)
+MAX_API_RETRIES = 2
 
 class QuestionGenerator:
     """
@@ -102,10 +107,8 @@ class QuestionGenerator:
         question_number: int,
         total_questions: int
     ) -> GeneratedQuestion | None:
-        """Generate a single question with retries."""
-        max_retries = 2
-        
-        for attempt in range(max_retries + 1):
+        """Generate a single question with retries and timeout handling."""
+        for attempt in range(MAX_API_RETRIES + 1):
             try:
                 system_prompt = self._build_system_prompt(difficulty)
                 user_message = self._build_user_message(
@@ -116,13 +119,17 @@ class QuestionGenerator:
                     question_number=question_number,
                     total_questions=total_questions
                 )
-                
-                response = await self.client.messages.create(
-                    model=self.model,
-                    max_tokens=2000,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_message}],
-                    temperature=0.3  # Balance creativity and consistency
+
+                # Use asyncio.wait_for for timeout handling
+                response = await asyncio.wait_for(
+                    self.client.messages.create(
+                        model=self.model,
+                        max_tokens=2000,
+                        system=system_prompt,
+                        messages=[{"role": "user", "content": user_message}],
+                        temperature=0.3  # Balance creativity and consistency
+                    ),
+                    timeout=CLAUDE_TIMEOUT_SECONDS
                 )
                 
                 # Extract text content
@@ -144,15 +151,28 @@ class QuestionGenerator:
                     if attempt < max_retries:
                         continue
                     
+            except asyncio.TimeoutError:
+                logging.error(f"Claude API timeout after {CLAUDE_TIMEOUT_SECONDS}s (attempt {attempt + 1})")
+                if attempt < MAX_API_RETRIES:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+
+            except (APITimeoutError, APIConnectionError) as e:
+                logging.error(f"Claude API connection error (attempt {attempt + 1}): {e}")
+                if attempt < MAX_API_RETRIES:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
             except json.JSONDecodeError as e:
                 logging.error(f"JSON parsing error (attempt {attempt + 1}): {e}")
-                if attempt < max_retries:
+                if attempt < MAX_API_RETRIES:
                     continue
+
             except Exception as e:
                 logging.error(f"Error generating question (attempt {attempt + 1}): {e}")
-                if attempt < max_retries:
+                if attempt < MAX_API_RETRIES:
                     continue
-                    
+
         return None
     
     def _build_system_prompt(self, difficulty: str) -> str:

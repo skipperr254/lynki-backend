@@ -1,13 +1,18 @@
 import json
 import logging
 import re
+import asyncio
 from typing import List, Dict, Any
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, APITimeoutError, APIConnectionError
 from anthropic.types import TextBlock
 from app.core.config import get_settings
 from app.core.supabase import get_supabase
 
 settings = get_settings()
+
+# Timeout configuration
+CLAUDE_TIMEOUT_SECONDS = 60  # 60 seconds for Haiku analysis
+MAX_API_RETRIES = 2
 
 class AnalysisService:
     def __init__(self):
@@ -38,8 +43,58 @@ class AnalysisService:
             raise e
 
     def _chunk_text(self, text: str, chunk_size: int = 8000) -> List[str]:
-        """Smaller chunks prevent hitting token limits. Character-based for simplicity."""
-        return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+        """
+        Split text into chunks that respect paragraph boundaries.
+        This prevents cutting content mid-sentence and preserves context.
+        """
+        if len(text) <= chunk_size:
+            return [text]
+
+        chunks = []
+        current_chunk = ""
+
+        # Split by double newlines (paragraphs) first, then single newlines
+        paragraphs = text.split("\n\n")
+
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+
+            # If adding this paragraph exceeds the limit
+            if len(current_chunk) + len(paragraph) + 2 > chunk_size:
+                # Save current chunk if it has content
+                if current_chunk.strip():
+                    chunks.append(current_chunk.strip())
+
+                # If a single paragraph is too long, split by sentences
+                if len(paragraph) > chunk_size:
+                    sentences = self._split_into_sentences(paragraph)
+                    current_chunk = ""
+                    for sentence in sentences:
+                        if len(current_chunk) + len(sentence) + 1 > chunk_size:
+                            if current_chunk.strip():
+                                chunks.append(current_chunk.strip())
+                            current_chunk = sentence
+                        else:
+                            current_chunk += (" " if current_chunk else "") + sentence
+                else:
+                    current_chunk = paragraph
+            else:
+                current_chunk += ("\n\n" if current_chunk else "") + paragraph
+
+        # Don't forget the last chunk
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+
+        return chunks if chunks else [text]
+
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """Split text into sentences for finer granularity."""
+        # Simple sentence splitting - handles common cases
+        import re
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        return [s.strip() for s in sentences if s.strip()]
     
     def _extract_and_clean_json(self, text: str) -> str:
         """Extract JSON from response and clean common formatting issues."""
@@ -64,9 +119,8 @@ class AnalysisService:
         return json_str
 
     async def _process_chunk(self, document_id: str, text_chunk: str, chunk_index: int, total_chunks: int):
-        # Retry logic for JSON parsing
-        max_retries = 2
-        for attempt in range(max_retries + 1):
+        # Retry logic for API calls and JSON parsing
+        for attempt in range(MAX_API_RETRIES + 1):
             try:
                 system_prompt = (
                     "You are an expert educational curriculum designer. "
@@ -84,15 +138,19 @@ class AnalysisService:
                 )
 
                 user_message = f"Content (Chunk {chunk_index+1}/{total_chunks}):\n\n{text_chunk}"
-                
-                response = await self.client.messages.create(
-                    model=self.model,
-                    max_tokens=4000,  # Haiku's safe limit
-                    system=system_prompt,
-                    messages=[
-                        {"role": "user", "content": user_message}
-                    ],
-                    temperature=0.1
+
+                # Use asyncio.wait_for for timeout handling
+                response = await asyncio.wait_for(
+                    self.client.messages.create(
+                        model=self.model,
+                        max_tokens=4000,  # Haiku's safe limit
+                        system=system_prompt,
+                        messages=[
+                            {"role": "user", "content": user_message}
+                        ],
+                        temperature=0.1
+                    ),
+                    timeout=CLAUDE_TIMEOUT_SECONDS
                 )
 
                 # Type-safe extraction of text content
@@ -119,14 +177,30 @@ class AnalysisService:
                 
                 break # Success
 
+            except asyncio.TimeoutError:
+                logging.error(f"Attempt {attempt+1}: Claude API timeout after {CLAUDE_TIMEOUT_SECONDS}s for chunk {chunk_index+1}")
+                if attempt < MAX_API_RETRIES:
+                    logging.info(f"Retrying chunk {chunk_index+1} after timeout...")
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                else:
+                    logging.error(f"Failed to process chunk {chunk_index+1} after {MAX_API_RETRIES+1} attempts due to timeouts")
+                    # Don't raise - continue with other chunks
+
+            except (APITimeoutError, APIConnectionError) as e:
+                logging.error(f"Attempt {attempt+1}: Claude API connection error for chunk {chunk_index+1}: {e}")
+                if attempt < MAX_API_RETRIES:
+                    logging.info(f"Retrying chunk {chunk_index+1} after connection error...")
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    logging.error(f"Failed to process chunk {chunk_index+1} after {MAX_API_RETRIES+1} attempts")
+
             except json.JSONDecodeError as e:
                 logging.error(f"Attempt {attempt+1}: Failed to parse JSON from Claude: {e}")
-                if attempt < max_retries:
-                    logging.error(f"Retrying chunk {chunk_index+1}...")
+                if attempt < MAX_API_RETRIES:
+                    logging.info(f"Retrying chunk {chunk_index+1} due to JSON error...")
                 else:
-                    # Log error with actual output for debugging
-                    logging.error(f"Failed to process chunk {chunk_index+1} after {max_retries+1} attempts.")
-                    # Only log response_text if it exists (it might not if error occurred before response)
+                    logging.error(f"Failed to process chunk {chunk_index+1} after {MAX_API_RETRIES+1} attempts.")
+
             except Exception as e:
                 logging.error(f"Unexpected error processing chunk {chunk_index+1}: {e}")
                 raise e

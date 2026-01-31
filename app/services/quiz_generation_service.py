@@ -1,8 +1,12 @@
 import logging
-from typing import List, Dict, Any, Optional
+import asyncio
+from typing import List, Dict, Any, Optional, Tuple
 from app.core.supabase import get_supabase
 from app.services.question_generator import QuestionGenerator
 from app.schemas.quiz import GeneratedQuestion
+
+# Concurrency limit for parallel question generation
+MAX_CONCURRENT_GENERATIONS = 3
 
 class QuizGenerationService:
     """
@@ -69,44 +73,64 @@ class QuizGenerationService:
             # 4. Update status to generating
             self._update_quiz_status(quiz_id, "generating")
             
-            # 5. Generate questions for each concept
+            # 5. Generate questions for each concept (in parallel batches)
             total_questions = 0
             failed_concepts = []
-            
-            for i, concept in enumerate(concepts, 1):
-                logging.info(f"Processing concept {i}/{len(concepts)}: {concept['name']}")
-                
-                try:
-                    # Determine number of questions dynamically
-                    num_questions = self.question_generator.calculate_questions_per_concept(
-                        concept_explanation=concept.get("explanation", ""),
-                        source_text=concept.get("source_text", ""),
-                        min_questions=min_questions_per_concept,
-                        max_questions=max_questions_per_concept
-                    )
-                    
-                    # Generate questions
-                    questions = await self.question_generator.generate_questions_for_concept(
-                        concept_id=concept["id"],
-                        concept_name=concept["name"],
-                        concept_explanation=concept.get("explanation", ""),
-                        source_text=concept.get("source_text", ""),
-                        num_questions=num_questions
-                    )
-                    
-                    # Save questions to database
-                    if questions:
-                        saved_count = self._save_questions(quiz_id, questions, total_questions)
-                        total_questions += saved_count
-                        logging.info(f"Saved {saved_count} questions for concept: {concept['name']}")
-                    else:
-                        failed_concepts.append(concept["name"])
-                        logging.warning(f"No questions generated for concept: {concept['name']}")
-                        
-                except Exception as e:
-                    failed_concepts.append(concept["name"])
-                    logging.error(f"Failed to generate questions for concept {concept['name']}: {e}")
-                    continue
+
+            logging.info(f"Starting parallel question generation for {len(concepts)} concepts (max {MAX_CONCURRENT_GENERATIONS} concurrent)")
+
+            # Process concepts in parallel batches
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
+
+            async def process_concept(concept: Dict[str, Any], concept_index: int) -> Tuple[List[GeneratedQuestion], Optional[str]]:
+                """Process a single concept with semaphore-controlled concurrency."""
+                async with semaphore:
+                    logging.info(f"Processing concept {concept_index}/{len(concepts)}: {concept['name']}")
+                    try:
+                        # Determine number of questions dynamically
+                        num_questions = self.question_generator.calculate_questions_per_concept(
+                            concept_explanation=concept.get("explanation", ""),
+                            source_text=concept.get("source_text", ""),
+                            min_questions=min_questions_per_concept,
+                            max_questions=max_questions_per_concept
+                        )
+
+                        # Generate questions
+                        questions = await self.question_generator.generate_questions_for_concept(
+                            concept_id=concept["id"],
+                            concept_name=concept["name"],
+                            concept_explanation=concept.get("explanation", ""),
+                            source_text=concept.get("source_text", ""),
+                            num_questions=num_questions
+                        )
+
+                        if questions:
+                            return (questions, None)
+                        else:
+                            return ([], concept["name"])
+
+                    except Exception as e:
+                        logging.error(f"Failed to generate questions for concept {concept['name']}: {e}")
+                        return ([], concept["name"])
+
+            # Run all concepts in parallel with controlled concurrency
+            tasks = [
+                process_concept(concept, i + 1)
+                for i, concept in enumerate(concepts)
+            ]
+            results = await asyncio.gather(*tasks)
+
+            # Process results and save questions
+            current_order_index = 0
+            for (questions, failed_concept_name) in results:
+                if failed_concept_name:
+                    failed_concepts.append(failed_concept_name)
+                    logging.warning(f"No questions generated for concept: {failed_concept_name}")
+                elif questions:
+                    saved_count = self._save_questions(quiz_id, questions, current_order_index)
+                    current_order_index += saved_count
+                    total_questions += saved_count
+                    logging.info(f"Saved {saved_count} questions")
             
             # 6. Update quiz status
             if total_questions > 0:
