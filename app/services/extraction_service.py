@@ -2,6 +2,7 @@ import io
 import logging
 import pypdf
 import docx
+from pptx import Presentation
 from app.core.supabase import get_supabase
 from app.schemas.document import DocumentUpdate
 from app.services.analysis_service import AnalysisService
@@ -166,15 +167,62 @@ class ExtractionService:
             pdf_reader = pypdf.PdfReader(file_stream)
             for page in pdf_reader.pages:
                 text += page.extract_text() + "\n"
-        
-        elif "word" in file_type or "docx" in file_type: # application/vnd.openxmlformats-officedocument.wordprocessingml.document
+
+        elif "word" in file_type or "docx" in file_type:
+            # application/vnd.openxmlformats-officedocument.wordprocessingml.document
             doc = docx.Document(file_stream)
+
+            # Extract from paragraphs
             for para in doc.paragraphs:
-                text += para.text + "\n"
-        
-        elif "text" in file_type: # text/plain
+                if para.text.strip():
+                    text += para.text + "\n"
+
+            # Extract text from tables
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = []
+                    for cell in row.cells:
+                        cell_text = cell.text.strip()
+                        if cell_text:
+                            row_text.append(cell_text)
+                    if row_text:
+                        text += " | ".join(row_text) + "\n"
+
+        elif "powerpoint" in file_type or "pptx" in file_type or "presentation" in file_type:
+            # application/vnd.openxmlformats-officedocument.presentationml.presentation
+            prs = Presentation(file_stream)
+
+            for slide_num, slide in enumerate(prs.slides, 1):
+                slide_text = []
+
+                for shape in slide.shapes:
+                    # Extract text from text frames
+                    if shape.has_text_frame:
+                        for paragraph in shape.text_frame.paragraphs:
+                            para_text = ""
+                            for run in paragraph.runs:
+                                if run.text:
+                                    para_text += run.text
+                            if para_text.strip():
+                                slide_text.append(para_text.strip())
+
+                    # Extract text from tables in slides
+                    if shape.has_table:
+                        for row in shape.table.rows:
+                            row_text = []
+                            for cell in row.cells:
+                                if cell.text.strip():
+                                    row_text.append(cell.text.strip())
+                            if row_text:
+                                slide_text.append(" | ".join(row_text))
+
+                if slide_text:
+                    text += f"--- Slide {slide_num} ---\n"
+                    text += "\n".join(slide_text) + "\n\n"
+
+        elif "text" in file_type:  # text/plain
             text = file_content.decode('utf-8')
-            
+
         else:
             raise ValueError(f"Unsupported file type: {file_type}")
 
