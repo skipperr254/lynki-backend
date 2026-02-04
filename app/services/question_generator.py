@@ -148,7 +148,7 @@ class QuestionGenerator:
                     return question
                 else:
                     logging.warning(f"Question quality validation failed (attempt {attempt + 1})")
-                    if attempt < max_retries:
+                    if attempt < MAX_API_RETRIES:
                         continue
                     
             except asyncio.TimeoutError:

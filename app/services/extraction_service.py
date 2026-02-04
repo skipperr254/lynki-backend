@@ -1,16 +1,20 @@
+import asyncio
 import io
 import logging
 import pypdf
 import docx
 from pptx import Presentation
 from app.core.supabase import get_supabase
-from app.schemas.document import DocumentUpdate
+from app.core.async_db import run_db_operation, db_storage_download
 from app.services.analysis_service import AnalysisService
 from app.services.quiz_generation_service import QuizGenerationService
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Maximum time allowed for entire document processing (10 minutes)
+DOCUMENT_PROCESSING_TIMEOUT = 600
 
 
 class ExtractionService:
@@ -27,15 +31,43 @@ class ExtractionService:
         2. Extract text
         3. Analyze with Claude (extract topics/concepts)
         4. Generate quiz questions
+
+        All database operations are async to prevent blocking the event loop.
         """
+        try:
+            # Wrap entire processing in a timeout
+            await asyncio.wait_for(
+                self._process_document_internal(document_id),
+                timeout=DOCUMENT_PROCESSING_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Document {document_id}: Processing timed out after {DOCUMENT_PROCESSING_TIMEOUT}s")
+            await self._update_status_with_error(
+                document_id,
+                "failed",
+                "Processing timed out. The document may be too large or complex. Please try a smaller document."
+            )
+        except Exception as e:
+            logger.exception(f"Document {document_id}: Unexpected error during processing")
+            await self._update_status_with_error(
+                document_id,
+                "failed",
+                "An unexpected error occurred during processing. Please try again."
+            )
+
+    async def _process_document_internal(self, document_id: str):
+        """Internal processing logic with proper async handling."""
         try:
             logger.info(f"Starting processing for document {document_id}")
 
-            # 1. Get document metadata
-            doc_response = self.supabase.table("documents").select("*").eq("id", document_id).single().execute()  # type: ignore
+            # 1. Get document metadata (ASYNC)
+            doc_response = await run_db_operation(
+                lambda: self.supabase.table("documents").select("*").eq("id", document_id).single().execute()
+            )
+
             if not doc_response.data:
                 logger.error(f"Document {document_id} not found in database")
-                self._update_status_with_error(document_id, "failed", "Document not found in database")
+                await self._update_status_with_error(document_id, "failed", "Document not found in database")
                 return
 
             doc = doc_response.data
@@ -43,42 +75,49 @@ class ExtractionService:
             # Type check the document data
             if not isinstance(doc, dict):
                 logger.error(f"Invalid document data format for {document_id}")
-                self._update_status_with_error(document_id, "failed", "Invalid document data format")
+                await self._update_status_with_error(document_id, "failed", "Invalid document data format")
                 return
 
-            # 2. Update status to processing
-            self._update_status(document_id, "processing")
+            # 2. Update status to processing (ASYNC)
+            await self._update_status(document_id, "processing")
             logger.info(f"Document {document_id}: Status updated to 'processing'")
 
-            # 3. Download file
+            # 3. Download file (ASYNC)
             file_path = doc.get("file_path")
             if not file_path or not isinstance(file_path, str):
                 raise ValueError("Document is missing file path")
 
             logger.info(f"Document {document_id}: Downloading file from storage...")
             try:
-                file_content = self.supabase.storage.from_(self.bucket_name).download(file_path)
+                file_content = await db_storage_download(self.supabase, self.bucket_name, file_path)
             except Exception as e:
                 raise ValueError(f"Failed to download file from storage: {str(e)}")
 
-            # 4. Extract text
+            # 4. Extract text (CPU-bound, run in executor to not block)
             file_type = doc.get("file_type")
             if not file_type or not isinstance(file_type, str):
                 raise ValueError("Document is missing file type")
 
             logger.info(f"Document {document_id}: Extracting text from {file_type}...")
             try:
-                extracted_text = self._extract_text(file_content, file_type)
+                # Run CPU-bound text extraction in executor
+                loop = asyncio.get_event_loop()
+                extracted_text = await loop.run_in_executor(
+                    None,
+                    lambda: self._extract_text(file_content, file_type)
+                )
             except ValueError as e:
                 raise ValueError(f"Text extraction failed: {str(e)}")
 
             if not extracted_text or len(extracted_text.strip()) < 50:
                 raise ValueError("Extracted text is too short or empty. Please upload a document with more content.")
 
-            # Save extracted text immediately so it's not lost if analysis fails
-            self.supabase.table("documents").update({
-                "extracted_text": extracted_text
-            }).eq("id", document_id).execute()  # type: ignore
+            # Save extracted text immediately so it's not lost if analysis fails (ASYNC)
+            await run_db_operation(
+                lambda: self.supabase.table("documents").update({
+                    "extracted_text": extracted_text
+                }).eq("id", document_id).execute()
+            )
             logger.info(f"Document {document_id}: Extracted {len(extracted_text)} characters of text")
 
             # 5. Extract Structure (Topics & Concepts)
@@ -89,18 +128,20 @@ class ExtractionService:
                 logger.error(f"Document {document_id}: Analysis failed - {str(e)}")
                 raise ValueError(f"AI analysis failed: {str(e)}")
 
-            # Verify concepts were created
-            concepts_count = self._count_document_concepts(document_id)
+            # Verify concepts were created (ASYNC)
+            concepts_count = await self._count_document_concepts(document_id)
             if concepts_count == 0:
                 raise ValueError("No concepts could be extracted from the document. The content may not be suitable for quiz generation.")
 
             logger.info(f"Document {document_id}: Analysis complete - {concepts_count} concepts extracted")
 
-            # 6. Mark document as completed BEFORE quiz generation
-            self.supabase.table("documents").update({
-                "status": "completed",
-                "error_message": None
-            }).eq("id", document_id).execute()  # type: ignore
+            # 6. Mark document as completed BEFORE quiz generation (ASYNC)
+            await run_db_operation(
+                lambda: self.supabase.table("documents").update({
+                    "status": "completed",
+                    "error_message": None
+                }).eq("id", document_id).execute()
+            )
             logger.info(f"Document {document_id}: Status updated to 'completed'")
 
             # 7. Generate Quiz Questions (after document is marked completed)
@@ -122,44 +163,50 @@ class ExtractionService:
             # User-friendly errors (validation, unsupported file types, etc.)
             error_message = str(e)
             logger.error(f"Document {document_id}: Processing failed - {error_message}")
-            self._update_status_with_error(document_id, "failed", error_message)
+            await self._update_status_with_error(document_id, "failed", error_message)
 
-        except Exception as e:
-            # Unexpected errors - provide a generic message but log the details
-            logger.exception(f"Document {document_id}: Unexpected error during processing")
-            self._update_status_with_error(
-                document_id,
-                "failed",
-                "An unexpected error occurred during processing. Please try again."
-            )
-
-    def _count_document_concepts(self, document_id: str) -> int:
-        """Count the number of concepts extracted for a document."""
+    async def _count_document_concepts(self, document_id: str) -> int:
+        """Count the number of concepts extracted for a document (ASYNC)."""
         try:
             # Get topics for document
-            topics_response = self.supabase.table("topics").select("id").eq("document_id", document_id).execute()  # type: ignore
+            topics_response = await run_db_operation(
+                lambda: self.supabase.table("topics").select("id").eq("document_id", document_id).execute()
+            )
             if not topics_response.data:
                 return 0
 
-            topic_ids = [t["id"] for t in topics_response.data]  # type: ignore
+            topic_ids = [t["id"] for t in topics_response.data]
 
             # Count concepts for those topics
-            concepts_response = self.supabase.table("concepts").select("id", count="exact").in_("topic_id", topic_ids).execute()  # type: ignore
+            concepts_response = await run_db_operation(
+                lambda: self.supabase.table("concepts").select("id", count="exact").in_("topic_id", topic_ids).execute()
+            )
             return concepts_response.count if concepts_response.count else 0
         except Exception:
             return 0
 
-    def _update_status_with_error(self, document_id: str, status: str, error_message: str):
-        """Update document status and error message."""
+    async def _update_status_with_error(self, document_id: str, status: str, error_message: str):
+        """Update document status and error message (ASYNC)."""
         try:
-            self.supabase.table("documents").update({
-                "status": status,
-                "error_message": error_message
-            }).eq("id", document_id).execute()  # type: ignore
+            await run_db_operation(
+                lambda: self.supabase.table("documents").update({
+                    "status": status,
+                    "error_message": error_message
+                }).eq("id", document_id).execute()
+            )
         except Exception as e:
             logger.error(f"Failed to update document {document_id} status: {e}")
 
+    async def _update_status(self, document_id: str, status: str):
+        """Update document status (ASYNC)."""
+        await run_db_operation(
+            lambda: self.supabase.table("documents").update({"status": status}).eq("id", document_id).execute()
+        )
+
     def _extract_text(self, file_content: bytes, file_type: str) -> str:
+        """
+        Extract text from file content. This is CPU-bound and should be run in an executor.
+        """
         text = ""
         file_stream = io.BytesIO(file_content)
 
@@ -227,6 +274,3 @@ class ExtractionService:
             raise ValueError(f"Unsupported file type: {file_type}")
 
         return text.strip()
-
-    def _update_status(self, document_id: str, status: str):
-        self.supabase.table("documents").update({"status": status}).eq("id", document_id).execute()  # type: ignore
