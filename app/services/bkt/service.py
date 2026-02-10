@@ -1,11 +1,67 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
-
+from math import prod
 from app.core.async_db import db_select_single
 from app.services.bkt.math import BKTParams, soft_evidence_update
 from app.services.bkt.repository import BKTRepository
+from app.core.async_db import db_select
 
+def aggregate_pass_probability(p_list: List[float]) -> float:
+    """Aggregate mastery probabilities using noisy-OR:
+       1 - Π(1 - p_k)
+    """
+    if not p_list:
+        return 0.0
+    return 1.0 - prod([1.0 - max(0.0, min(1.0, p)) for p in p_list])
+
+
+class BKTServiceAdditions:
+    """Service methods added in Milestone 3."""
+
+    @staticmethod
+    async def get_mastery_for_document(user_id: str, document_id: str) -> Dict[str, Any]:
+        # Resolve concepts (skills) for the document
+        concepts = await db_select(
+            "concepts",
+            filters={"document_id": document_id},
+        )
+
+        skills = []
+        p_list = []
+
+        for c in concepts:
+            kc_id = c["id"]
+            row = await BKTRepository.get_row(user_id, kc_id)
+            if not row:
+                continue
+
+            p = float(row["p_mastery"])
+            p_list.append(p)
+
+            skills.append(
+                {
+                    "skill_name": c.get("title") or c.get("name"),
+                    "mastery": p,
+                    "attempts": int(row.get("total_attempts", 0)),
+                }
+            )
+
+        return {
+            "pass_probability": aggregate_pass_probability(p_list),
+            "skills": skills,
+        }
+
+    @staticmethod
+    async def get_weak_skills_for_document(
+        user_id: str, document_id: str, limit: int = 5
+    ) -> Dict[str, Any]:
+        mastery = await BKTServiceAdditions.get_mastery_for_document(user_id, document_id)
+        skills = mastery["skills"]
+
+        weakest = sorted(skills, key=lambda s: s["mastery"])[:limit]
+
+        return {"skills": weakest}
 
 def _normalize_score(claude_score: float) -> float:
     try:
