@@ -7,6 +7,8 @@ from app.schemas.bkt import (
     BKTUpdateResponse,
     BKTSummaryResponse,
     BKTWeakSkillsResponse,
+    BKTBatchUpdateRequest,
+    BKTBatchUpdateResponse,
 )
 from app.services.bkt.service import BKTService
 
@@ -16,23 +18,31 @@ router = APIRouter()
 @router.post("/update", response_model=BKTUpdateResponse)
 async def update_bkt(req: BKTUpdateRequest):
     try:
-        result = await BKTService.update_mastery_for_response(
+        return await BKTService.update_mastery_for_response(
             user_id=req.user_id,
             question_id=req.question_id,
+            document_id=req.document_id,
             claude_score=req.claude_score,
         )
-        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/update-batch", response_model=BKTBatchUpdateResponse)
+async def update_bkt_batch(req: BKTBatchUpdateRequest):
+    try:
+        updates = [(u.question_id, u.claude_score) for u in req.updates]
+        return await BKTService.update_mastery_batch(
+            user_id=req.user_id,
+            document_id=req.document_id,
+            updates=updates,
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/mastery/{user_id}/{document_id}", response_model=BKTSummaryResponse)
 async def get_mastery(user_id: str, document_id: str):
-    """Return aggregated pass probability and per-skill mastery.
-
-    NOTE: For now, we treat document_id as the 'subject' grouping,
-    since the current Lynki schema is document/topic/concept-based.
-    """
     try:
         return await BKTService.get_mastery_for_document(user_id, document_id)
     except Exception as e:
