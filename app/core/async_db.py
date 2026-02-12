@@ -1,50 +1,27 @@
 """
 Async database helpers for non-blocking Supabase operations.
 
-The Supabase Python SDK uses synchronous HTTP calls which block the asyncio event loop.
-This module provides async wrappers that run database operations in a thread pool executor,
-preventing event loop blocking and allowing concurrent request handling.
-
-IMPORTANT: Always use these helpers instead of direct .execute() calls in async functions.
+Goals:
+- Never block the asyncio event loop (Supabase SDK is sync).
+- Avoid PostgREST 204 "No Content" / "Missing response" issues by requesting representation.
+- Avoid using .select() on builders that don't support it (update/delete in some SDK versions).
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
-from functools import partial
-from typing import TypeVar, Callable, Any
+from typing import Any, Callable, TypeVar, Optional
 from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
-# Dedicated thread pool for database operations
-# Using a separate pool prevents database I/O from competing with other async tasks
 _db_executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="supabase_db_")
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 async def run_db_operation(operation: Callable[[], T]) -> T:
-    """
-    Run a blocking database operation in the thread pool executor.
-
-    This prevents the operation from blocking the asyncio event loop,
-    allowing other async tasks to continue while waiting for the database.
-
-    Usage:
-        # Instead of:
-        result = supabase.table("documents").select("*").execute()
-
-        # Use:
-        result = await run_db_operation(
-            lambda: supabase.table("documents").select("*").execute()
-        )
-
-    Args:
-        operation: A callable that performs the database operation
-
-    Returns:
-        The result of the database operation
-    """
     loop = asyncio.get_event_loop()
     try:
         return await loop.run_in_executor(_db_executor, operation)
@@ -53,98 +30,124 @@ async def run_db_operation(operation: Callable[[], T]) -> T:
         raise
 
 
+def _try_execute(builder) -> Any:
+    """
+    Centralized execute with a safe fallback when SDK returns 204 or produces 'Missing response'
+    errors in some versions. We just re-raise; callers can handle.
+    """
+    return builder.execute()
+
+
 async def db_select(supabase, table: str, columns: str = "*", **filters) -> Any:
-    """
-    Async wrapper for SELECT queries.
-
-    Args:
-        supabase: Supabase client instance
-        table: Table name
-        columns: Columns to select (default "*")
-        **filters: Filter conditions as keyword arguments
-
-    Returns:
-        Query result
-    """
     def _execute():
-        query = supabase.table(table).select(columns)
-        for key, value in filters.items():
-            query = query.eq(key, value)
-        return query.execute()
+        q = supabase.table(table).select(columns)
+        for k, v in filters.items():
+            q = q.eq(k, v)
+        return _try_execute(q)
 
     return await run_db_operation(_execute)
 
 
 async def db_select_single(supabase, table: str, columns: str = "*", **filters) -> Any:
     """
-    Async wrapper for SELECT queries expecting a single result.
+    Single row read:
+    - maybe_single() prevents PGRST116 when 0 rows.
     """
     def _execute():
-        query = supabase.table(table).select(columns)
-        for key, value in filters.items():
-            query = query.eq(key, value)
-        return query.single().execute()
+        q = supabase.table(table).select(columns)
+        for k, v in filters.items():
+            q = q.eq(k, v)
+        # important
+        return _try_execute(q.maybe_single())
 
     return await run_db_operation(_execute)
 
 
-async def db_insert(supabase, table: str, data: dict | list) -> Any:
+async def db_insert(supabase, table: str, data: dict | list, returning: str = "representation") -> Any:
     """
-    Async wrapper for INSERT queries.
-
-    Args:
-        supabase: Supabase client instance
-        table: Table name
-        data: Data to insert (dict for single row, list for multiple)
-
-    Returns:
-        Query result
+    Insert with returning representation to avoid 204.
     """
     def _execute():
-        return supabase.table(table).insert(data).execute()
+        # Most supabase-py versions support returning=
+        try:
+            q = supabase.table(table).insert(data, returning=returning)
+            return _try_execute(q)
+        except TypeError:
+            # Older versions: no returning param -> fallback
+            q = supabase.table(table).insert(data)
+            return _try_execute(q)
 
     return await run_db_operation(_execute)
 
 
-async def db_update(supabase, table: str, data: dict, **filters) -> Any:
+async def db_update(supabase, table: str, data: dict, returning: str = "representation", **filters) -> Any:
     """
-    Async wrapper for UPDATE queries.
-
-    Args:
-        supabase: Supabase client instance
-        table: Table name
-        data: Data to update
-        **filters: Filter conditions
-
-    Returns:
-        Query result
+    Update:
+    - DO NOT chain .select() (not supported in some versions)
+    - ask for returning representation when available
     """
     def _execute():
-        query = supabase.table(table).update(data)
-        for key, value in filters.items():
-            query = query.eq(key, value)
-        return query.execute()
+        try:
+            q = supabase.table(table).update(data, returning=returning)
+        except TypeError:
+            q = supabase.table(table).update(data)
+
+        for k, v in filters.items():
+            q = q.eq(k, v)
+
+        return _try_execute(q)
 
     return await run_db_operation(_execute)
 
 
-async def db_delete(supabase, table: str, **filters) -> Any:
+async def db_upsert(
+    supabase,
+    table: str,
+    data: dict | list,
+    on_conflict: Optional[str] = None,
+    returning: str = "representation",
+) -> Any:
     """
-    Async wrapper for DELETE queries.
+    Upsert:
+    - safest path for concurrency
     """
     def _execute():
-        query = supabase.table(table).delete()
-        for key, value in filters.items():
-            query = query.eq(key, value)
-        return query.execute()
+        kwargs = {}
+        if on_conflict:
+            kwargs["on_conflict"] = on_conflict
+
+        try:
+            q = supabase.table(table).upsert(data, returning=returning, **kwargs)
+            return _try_execute(q)
+        except TypeError:
+            # Older versions: no returning param
+            q = supabase.table(table).upsert(data, **kwargs)
+            return _try_execute(q)
+
+    return await run_db_operation(_execute)
+
+
+async def db_delete(supabase, table: str, returning: str = "representation", **filters) -> Any:
+    """
+    Delete:
+    - DO NOT chain .select()
+    - ask for returning if possible
+    """
+    def _execute():
+        try:
+            q = supabase.table(table).delete(returning=returning)
+        except TypeError:
+            q = supabase.table(table).delete()
+
+        for k, v in filters.items():
+            q = q.eq(k, v)
+
+        return _try_execute(q)
 
     return await run_db_operation(_execute)
 
 
 async def db_storage_download(supabase, bucket: str, path: str) -> bytes:
-    """
-    Async wrapper for storage downloads.
-    """
     def _execute():
         return supabase.storage.from_(bucket).download(path)
 
@@ -152,8 +155,4 @@ async def db_storage_download(supabase, bucket: str, path: str) -> bytes:
 
 
 def shutdown_db_executor():
-    """
-    Shutdown the database executor gracefully.
-    Call this when the application is shutting down.
-    """
     _db_executor.shutdown(wait=True)
