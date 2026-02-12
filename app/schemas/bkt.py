@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from pydantic import BaseModel, Field
 from typing import List
 
@@ -17,9 +18,11 @@ class BKTSummaryResponse(BaseModel):
 class BKTWeakSkillsResponse(BaseModel):
     skills: List[BKTSkill]
 
+
 class BKTUpdateRequest(BaseModel):
     user_id: str
     question_id: str
+    document_id: str
     claude_score: float = Field(..., ge=0, le=100)
 
 
@@ -28,3 +31,21 @@ class BKTUpdateResponse(BaseModel):
     question_id: str
     q: float
     updated: list
+
+
+class BKTBatchItem(BaseModel):
+    question_id: str
+    claude_score: float = Field(..., ge=0, le=100)
+
+
+class BKTBatchUpdateRequest(BaseModel):
+    user_id: str
+    document_id: str
+    updates: List[BKTBatchItem]
+
+
+class BKTBatchUpdateResponse(BaseModel):
+    user_id: str
+    document_id: str
+    count: int
+    results: list
