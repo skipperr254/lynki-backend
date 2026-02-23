@@ -5,10 +5,13 @@ This service is the single source of truth for mastery tracking.
 It drives:
   - Mastery updates after each answer (Bayesian posterior + learning transition)
   - Adaptive session generation (weighted random concept selection, interleaved questions)
-  - Progress reporting (per-concept, per-topic, per-document mastery)
+  - Progress reporting (per-concept, per-topic, per-course mastery)
 
 The frontend is a thin client: it fetches sessions, submits answers, and displays progress.
 All question-selection intelligence lives here.
+
+Mastery is scoped per COURSE. A course contains multiple documents, each with topics
+and concepts. All concepts across all documents in a course share one mastery pool.
 """
 
 from __future__ import annotations
@@ -37,27 +40,14 @@ _supabase = get_supabase()
 
 # ---------------------------------------------------------------------------
 # BKT configuration constants
-# These are easy to tune. Adjust based on feedback and usage data.
 # ---------------------------------------------------------------------------
 
-# Mastery threshold — when p_mastery >= this value, a concept is considered "mastered".
-# 0.85 is a balanced target; raise for stricter mastery, lower for faster progression.
 MASTERY_THRESHOLD: float = 0.85
-
-# Maximum questions per adaptive session (prevents fatigue).
 SESSION_MAX_QUESTIONS: int = 12
-
-# Minimum questions per session (ensures meaningful practice even if few unmastered).
 SESSION_MIN_QUESTIONS: int = 5
-
-# How many hours before a recently-answered question can be served again.
 RECENTLY_SEEN_HOURS: int = 4
-
-# Max concepts to interleave within a single session.
-# Research shows interleaving 3-5 concepts improves retention.
 MAX_CONCEPTS_PER_SESSION: int = 5
 
-# Default BKT parameters (match the DB column defaults).
 DEFAULTS: Dict[str, Any] = {
     "p_mastery": 0.2,
     "p_init": 0.2,
@@ -120,9 +110,33 @@ async def _insert(table: str, data: dict | list) -> Any:
     return getattr(resp, "data", None)
 
 
-async def _get_concepts_for_document(document_id: str) -> List[Dict[str, Any]]:
-    """Fetch concepts for a document via topics -> concepts join."""
-    topics = await _select("topics", "id, name", document_id=document_id)
+# ---------------------------------------------------------------------------
+# Course-scoped data fetchers
+# ---------------------------------------------------------------------------
+
+async def _get_documents_for_course(course_id: str) -> List[Dict[str, Any]]:
+    """Fetch all documents belonging to a course."""
+    return await _select("documents", "id, title", course_id=course_id)
+
+
+async def _get_topics_for_course(course_id: str) -> List[Dict[str, Any]]:
+    """Fetch all topics across all documents in a course."""
+    docs = await _get_documents_for_course(course_id)
+    if not docs:
+        return []
+    doc_ids = [d["id"] for d in docs]
+    resp = await run_db_operation(
+        lambda: _supabase.table("topics")
+        .select("id, name, document_id")
+        .in_("document_id", doc_ids)
+        .execute()
+    )
+    return getattr(resp, "data", None) or []
+
+
+async def _get_concepts_for_course(course_id: str) -> List[Dict[str, Any]]:
+    """Fetch all concepts across all documents in a course (via documents -> topics -> concepts)."""
+    topics = await _get_topics_for_course(course_id)
     if not topics:
         return []
     topic_ids = [t["id"] for t in topics]
@@ -133,11 +147,6 @@ async def _get_concepts_for_document(document_id: str) -> List[Dict[str, Any]]:
         .execute()
     )
     return getattr(resp, "data", None) or []
-
-
-async def _get_topics_for_document(document_id: str) -> List[Dict[str, Any]]:
-    """Fetch topics for a document."""
-    return await _select("topics", "id, name", document_id=document_id)
 
 
 async def _get_questions_for_concepts(concept_ids: List[str]) -> List[Dict[str, Any]]:
@@ -176,13 +185,16 @@ class BKTService:
     """
     Core adaptive learning service.
 
+    All mastery is scoped per COURSE. A course aggregates concepts from all
+    its documents into a single mastery pool.
+
     Methods:
     - update_mastery_for_response / update_mastery_batch  — BKT updates after answers
     - get_next_session         — build an adaptive session (weighted random, interleaved)
     - process_answer           — check correctness + BKT update + record attempt
-    - get_document_progress    — full mastery tree for the overview page
-    - get_mastery_for_document — legacy: flat skill list + pass probability
-    - get_weak_skills_for_document — legacy: N weakest skills
+    - get_course_progress      — full mastery tree for the overview page
+    - get_mastery_for_course   — flat skill list + pass probability
+    - get_weak_skills_for_course — N weakest skills
     """
 
     # -----------------------------------------------------------------------
@@ -200,17 +212,17 @@ class BKTService:
         return [str(kc_id)]
 
     @staticmethod
-    async def _ensure_mastery_row(user_id: str, document_id: str, kc_id: str) -> Dict[str, Any]:
-        """Upsert on (user_id, document_id, knowledge_component_id)."""
+    async def _ensure_mastery_row(user_id: str, course_id: str, kc_id: str) -> Dict[str, Any]:
+        """Upsert on (user_id, course_id, knowledge_component_id)."""
         payload = {
             "user_id": user_id,
-            "document_id": document_id,
+            "course_id": course_id,
             "knowledge_component_id": kc_id,
         }
         data = await _upsert(
             "bkt_mastery",
             payload,
-            on_conflict="user_id,document_id,knowledge_component_id",
+            on_conflict="user_id,course_id,knowledge_component_id",
         )
         if isinstance(data, list) and data:
             return data[0]
@@ -218,7 +230,7 @@ class BKTService:
             return data
         rows = await _select(
             "bkt_mastery", "*",
-            user_id=user_id, document_id=document_id, knowledge_component_id=kc_id,
+            user_id=user_id, course_id=course_id, knowledge_component_id=kc_id,
         )
         if not rows:
             raise RuntimeError("Failed to ensure bkt_mastery row")
@@ -228,7 +240,7 @@ class BKTService:
     async def update_mastery_for_response(
         user_id: str,
         question_id: str,
-        document_id: str,
+        course_id: str,
         claude_score: float,
         kc_weights: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
@@ -237,7 +249,7 @@ class BKTService:
         results: List[Dict[str, Any]] = []
 
         for kc_id in kc_ids:
-            row = await BKTService._ensure_mastery_row(user_id, document_id, kc_id)
+            row = await BKTService._ensure_mastery_row(user_id, course_id, kc_id)
             p_before = float(row.get("p_mastery", DEFAULTS["p_mastery"]))
             params = BKTParams(
                 p_learn=float(row.get("p_transit", DEFAULTS["p_transit"])),
@@ -281,7 +293,7 @@ class BKTService:
     @staticmethod
     async def update_mastery_batch(
         user_id: str,
-        document_id: str,
+        course_id: str,
         updates: List[Tuple[str, float]],
     ) -> Dict[str, Any]:
         out = []
@@ -289,10 +301,10 @@ class BKTService:
             out.append(
                 await BKTService.update_mastery_for_response(
                     user_id=user_id, question_id=question_id,
-                    document_id=document_id, claude_score=score,
+                    course_id=course_id, claude_score=score,
                 )
             )
-        return {"user_id": user_id, "document_id": document_id, "count": len(updates), "results": out}
+        return {"user_id": user_id, "course_id": course_id, "count": len(updates), "results": out}
 
     # -----------------------------------------------------------------------
     # Adaptive session generation
@@ -301,14 +313,14 @@ class BKTService:
     @staticmethod
     async def get_next_session(
         user_id: str,
-        document_id: str,
+        course_id: str,
         topic_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Build an adaptive study session.
+        Build an adaptive study session for a course.
 
         Algorithm:
-        1. Fetch concepts (scoped to topic_id if provided, else whole document).
+        1. Fetch concepts (scoped to topic_id if provided, else whole course).
         2. For each concept, read BKT mastery (default if no row).
         3. Filter out fully mastered concepts (p_mastery >= MASTERY_THRESHOLD).
         4. Weighted random selection: weight = (1 - p_mastery). Lower mastery -> higher chance.
@@ -324,13 +336,13 @@ class BKTService:
                 topic_id=topic_id,
             )
         else:
-            all_concepts = await _get_concepts_for_document(document_id)
+            all_concepts = await _get_concepts_for_course(course_id)
 
         if not all_concepts:
             return {"session_id": str(uuid.uuid4()), "questions": [], "concepts": [], "all_mastered": True}
 
-        # 2. Fetch mastery rows
-        mastery_rows = await _select("bkt_mastery", "*", user_id=user_id, document_id=document_id)
+        # 2. Fetch mastery rows for this course
+        mastery_rows = await _select("bkt_mastery", "*", user_id=user_id, course_id=course_id)
         mastery_map: Dict[str, Dict[str, Any]] = {
             r["knowledge_component_id"]: r for r in mastery_rows
         }
@@ -482,7 +494,7 @@ class BKTService:
     async def process_answer(
         user_id: str,
         question_id: str,
-        document_id: str,
+        course_id: str,
         selected_option_index: int,
         session_id: Optional[str] = None,
         time_spent_ms: Optional[int] = None,
@@ -536,12 +548,12 @@ class BKTService:
             "session_id": session_id,
         })
 
-        # 3. BKT update
+        # 3. BKT update (scoped to course)
         claude_score = 100.0 if is_correct else 0.0
         bkt_result = await BKTService.update_mastery_for_response(
             user_id=user_id,
             question_id=question_id,
-            document_id=document_id,
+            course_id=course_id,
             claude_score=claude_score,
         )
 
@@ -569,24 +581,24 @@ class BKTService:
         }
 
     # -----------------------------------------------------------------------
-    # Document progress tree (for the overview page)
+    # Course progress tree (for the overview page)
     # -----------------------------------------------------------------------
 
     @staticmethod
-    async def get_document_progress(user_id: str, document_id: str) -> Dict[str, Any]:
+    async def get_course_progress(user_id: str, course_id: str) -> Dict[str, Any]:
         """
-        Full mastery progress tree: document -> topics -> concepts.
-        Each concept has its BKT p_mastery. Topics and document have aggregate progress.
+        Full mastery progress tree: course -> topics -> concepts.
+        Each concept has its BKT p_mastery. Topics and course have aggregate progress.
         """
-        doc = await _select_single("documents", "id, title", id=document_id)
-        if not doc:
-            raise ValueError(f"Document not found: {document_id}")
+        course = await _select_single("courses", "id, title", id=course_id)
+        if not course:
+            raise ValueError(f"Course not found: {course_id}")
 
-        topics = await _get_topics_for_document(document_id)
+        topics = await _get_topics_for_course(course_id)
         if not topics:
             return {
-                "document_id": document_id,
-                "document_title": doc.get("title", "Untitled"),
+                "course_id": course_id,
+                "course_title": course.get("title", "Untitled"),
                 "topics": [],
                 "total_concepts": 0,
                 "mastered_concepts": 0,
@@ -594,10 +606,10 @@ class BKTService:
                 "mastery_threshold": MASTERY_THRESHOLD,
             }
 
-        all_concepts = await _get_concepts_for_document(document_id)
+        all_concepts = await _get_concepts_for_course(course_id)
         concept_ids = [c["id"] for c in all_concepts]
 
-        mastery_rows = await _select("bkt_mastery", "*", user_id=user_id, document_id=document_id)
+        mastery_rows = await _select("bkt_mastery", "*", user_id=user_id, course_id=course_id)
         mastery_map = {r["knowledge_component_id"]: r for r in mastery_rows}
 
         # Question counts per concept
@@ -681,8 +693,8 @@ class BKTService:
         overall = round((total_mastered / total_concepts) * 100) if total_concepts > 0 else 0
 
         return {
-            "document_id": document_id,
-            "document_title": doc.get("title", "Untitled"),
+            "course_id": course_id,
+            "course_title": course.get("title", "Untitled"),
             "topics": topic_progress_list,
             "total_concepts": total_concepts,
             "mastered_concepts": total_mastered,
@@ -691,16 +703,16 @@ class BKTService:
         }
 
     # -----------------------------------------------------------------------
-    # Legacy endpoints (kept for backward compat; uses proper joins)
+    # Legacy-style helpers (now course-scoped)
     # -----------------------------------------------------------------------
 
     @staticmethod
-    async def get_mastery_for_document(user_id: str, document_id: str) -> Dict[str, Any]:
-        concepts = await _get_concepts_for_document(document_id)
+    async def get_mastery_for_course(user_id: str, course_id: str) -> Dict[str, Any]:
+        concepts = await _get_concepts_for_course(course_id)
         skills: List[Dict[str, Any]] = []
         p_list: List[float] = []
 
-        mastery_rows = await _select("bkt_mastery", "*", user_id=user_id, document_id=document_id)
+        mastery_rows = await _select("bkt_mastery", "*", user_id=user_id, course_id=course_id)
         mastery_map = {r["knowledge_component_id"]: r for r in mastery_rows}
 
         for c in concepts:
@@ -718,7 +730,7 @@ class BKTService:
         return {"pass_probability": aggregate_pass_probability(p_list), "skills": skills}
 
     @staticmethod
-    async def get_weak_skills_for_document(user_id: str, document_id: str, limit: int = 5) -> Dict[str, Any]:
-        mastery = await BKTService.get_mastery_for_document(user_id, document_id)
+    async def get_weak_skills_for_course(user_id: str, course_id: str, limit: int = 5) -> Dict[str, Any]:
+        mastery = await BKTService.get_mastery_for_course(user_id, course_id)
         weakest = sorted(mastery["skills"], key=lambda s: float(s["mastery"]))[:limit]
         return {"skills": weakest}

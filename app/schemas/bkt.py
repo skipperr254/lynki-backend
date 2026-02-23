@@ -26,7 +26,7 @@ class BKTWeakSkillsResponse(BaseModel):
 class BKTUpdateRequest(BaseModel):
     user_id: str
     question_id: str
-    document_id: str
+    course_id: str
     claude_score: float = Field(..., ge=0, le=100)
 
 
@@ -44,13 +44,13 @@ class BKTBatchItem(BaseModel):
 
 class BKTBatchUpdateRequest(BaseModel):
     user_id: str
-    document_id: str
+    course_id: str
     updates: List[BKTBatchItem]
 
 
 class BKTBatchUpdateResponse(BaseModel):
     user_id: str
-    document_id: str
+    course_id: str
     count: int
     results: list
 
@@ -97,7 +97,7 @@ class BKTSessionResponse(BaseModel):
 class BKTAnswerRequest(BaseModel):
     user_id: str
     question_id: str
-    document_id: str
+    course_id: str
     selected_option_index: int
     session_id: Optional[str] = None
     time_spent_ms: Optional[int] = None
@@ -142,8 +142,8 @@ class TopicProgress(BaseModel):
 
 
 class BKTProgressResponse(BaseModel):
-    document_id: str
-    document_title: str
+    course_id: str
+    course_title: str
     topics: List[TopicProgress]
     total_concepts: int
     mastered_concepts: int

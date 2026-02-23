@@ -21,24 +21,25 @@ router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
-# New adaptive learning endpoints
+# Adaptive learning endpoints (course-scoped)
 # ---------------------------------------------------------------------------
 
-@router.get("/session/{user_id}/{document_id}", response_model=BKTSessionResponse)
+@router.get("/session/{user_id}/{course_id}", response_model=BKTSessionResponse)
 async def get_session(
     user_id: str,
-    document_id: str,
+    course_id: str,
     topic_id: Optional[str] = Query(None, description="Scope session to a specific topic"),
 ):
     """
-    Get an adaptive study session.
-    Returns questions selected via weighted random from unmastered concepts.
+    Get an adaptive study session for a course.
+    Returns questions selected via weighted random from unmastered concepts
+    across all documents in the course.
     Questions do NOT include correct answers — answers are validated server-side.
     """
     try:
         result = await BKTService.get_next_session(
             user_id=user_id,
-            document_id=document_id,
+            course_id=course_id,
             topic_id=topic_id,
         )
         return result
@@ -56,7 +57,7 @@ async def submit_answer(req: BKTAnswerRequest):
         result = await BKTService.process_answer(
             user_id=req.user_id,
             question_id=req.question_id,
-            document_id=req.document_id,
+            course_id=req.course_id,
             selected_option_index=req.selected_option_index,
             session_id=req.session_id,
             time_spent_ms=req.time_spent_ms,
@@ -68,13 +69,14 @@ async def submit_answer(req: BKTAnswerRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/progress/{user_id}/{document_id}", response_model=BKTProgressResponse)
-async def get_progress(user_id: str, document_id: str):
+@router.get("/progress/{user_id}/{course_id}", response_model=BKTProgressResponse)
+async def get_progress(user_id: str, course_id: str):
     """
-    Get full document progress tree: topics -> concepts with BKT mastery values.
+    Get full course progress tree: topics -> concepts with BKT mastery values.
+    Aggregates across all documents in the course.
     """
     try:
-        return await BKTService.get_document_progress(user_id, document_id)
+        return await BKTService.get_course_progress(user_id, course_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -82,7 +84,7 @@ async def get_progress(user_id: str, document_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Legacy endpoints (kept for backward compat)
+# Legacy-style endpoints (now course-scoped)
 # ---------------------------------------------------------------------------
 
 @router.post("/update", response_model=BKTUpdateResponse)
@@ -91,7 +93,7 @@ async def update_bkt(req: BKTUpdateRequest):
         return await BKTService.update_mastery_for_response(
             user_id=req.user_id,
             question_id=req.question_id,
-            document_id=req.document_id,
+            course_id=req.course_id,
             claude_score=req.claude_score,
         )
     except Exception as e:
@@ -104,24 +106,24 @@ async def update_bkt_batch(req: BKTBatchUpdateRequest):
         updates = [(u.question_id, u.claude_score) for u in req.updates]
         return await BKTService.update_mastery_batch(
             user_id=req.user_id,
-            document_id=req.document_id,
+            course_id=req.course_id,
             updates=updates,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/mastery/{user_id}/{document_id}", response_model=BKTSummaryResponse)
-async def get_mastery(user_id: str, document_id: str):
+@router.get("/mastery/{user_id}/{course_id}", response_model=BKTSummaryResponse)
+async def get_mastery(user_id: str, course_id: str):
     try:
-        return await BKTService.get_mastery_for_document(user_id, document_id)
+        return await BKTService.get_mastery_for_course(user_id, course_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/weak-skills/{user_id}/{document_id}", response_model=BKTWeakSkillsResponse)
-async def get_weak_skills(user_id: str, document_id: str):
+@router.get("/weak-skills/{user_id}/{course_id}", response_model=BKTWeakSkillsResponse)
+async def get_weak_skills(user_id: str, course_id: str):
     try:
-        return await BKTService.get_weak_skills_for_document(user_id, document_id)
+        return await BKTService.get_weak_skills_for_course(user_id, course_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
