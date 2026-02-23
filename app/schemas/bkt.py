@@ -65,6 +65,8 @@ class SessionQuestionOption(BaseModel):
     id: str
     text: str
     index: int
+    is_correct: bool = False
+    explanation: Optional[str] = None
 
 
 class SessionQuestion(BaseModel):

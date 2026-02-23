@@ -212,13 +212,32 @@ class BKTService:
         return [str(kc_id)]
 
     @staticmethod
+    async def _resolve_document_id(kc_id: str) -> Optional[str]:
+        """Resolve concept → topic → document_id."""
+        try:
+            concept = await _select_single("concepts", "topic_id", id=kc_id)
+            if concept and concept.get("topic_id"):
+                topic = await _select_single("topics", "document_id", id=concept["topic_id"])
+                if topic and topic.get("document_id"):
+                    return str(topic["document_id"])
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
     async def _ensure_mastery_row(user_id: str, course_id: str, kc_id: str) -> Dict[str, Any]:
         """Upsert on (user_id, course_id, knowledge_component_id)."""
+        # Resolve document_id from concept chain (optional metadata)
+        document_id = await BKTService._resolve_document_id(kc_id)
+
         payload = {
             "user_id": user_id,
             "course_id": course_id,
             "knowledge_component_id": kc_id,
         }
+        if document_id:
+            payload["document_id"] = document_id
+
         data = await _upsert(
             "bkt_mastery",
             payload,
@@ -463,7 +482,13 @@ class BKTService:
                     "Unknown",
                 ),
                 "options": [
-                    {"id": o.get("id", ""), "text": o["option_text"], "index": o["option_index"]}
+                    {
+                        "id": o.get("id", ""),
+                        "text": o["option_text"],
+                        "index": o["option_index"],
+                        "is_correct": bool(o.get("is_correct", False)),
+                        "explanation": o.get("explanation") or "",
+                    }
                     for o in options
                 ],
             })
