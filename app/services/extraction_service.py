@@ -13,8 +13,10 @@ from app.services.quiz_generation_service import QuizGenerationService
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Maximum time allowed for entire document processing (10 minutes)
+# Maximum time allowed for document processing (extraction + analysis) (10 minutes)
 DOCUMENT_PROCESSING_TIMEOUT = 600
+# Separate timeout for quiz generation (15 minutes — AI question gen is slow for large docs)
+QUIZ_GENERATION_TIMEOUT = 900
 
 
 class ExtractionService:
@@ -32,10 +34,14 @@ class ExtractionService:
         3. Analyze with Claude (extract topics/concepts)
         4. Generate quiz questions
 
+        Steps 1-3 are critical (document marked completed only after analysis).
+        Step 4 (quiz gen) runs separately so its failure/timeout never reverts
+        a successfully analysed document back to 'failed'.
+
         All database operations are async to prevent blocking the event loop.
         """
+        # --- Phase 1: extraction + analysis (with timeout) ----------------
         try:
-            # Wrap entire processing in a timeout
             await asyncio.wait_for(
                 self._process_document_internal(document_id),
                 timeout=DOCUMENT_PROCESSING_TIMEOUT
@@ -47,6 +53,7 @@ class ExtractionService:
                 "failed",
                 "Processing timed out. The document may be too large or complex. Please try a smaller document."
             )
+            return  # don't attempt quiz gen
         except Exception as e:
             logger.exception(f"Document {document_id}: Unexpected error during processing")
             await self._update_status_with_error(
@@ -54,9 +61,49 @@ class ExtractionService:
                 "failed",
                 "An unexpected error occurred during processing. Please try again."
             )
+            return  # don't attempt quiz gen
+
+        # --- Phase 2: quiz generation (separate, non-fatal) ---------------
+        await self._generate_quiz_safe(document_id)
+
+    async def _generate_quiz_safe(self, document_id: str):
+        """Run quiz generation in a way that never reverts the document status."""
+        try:
+            doc_response = await run_db_operation(
+                lambda: self.supabase.table("documents").select("id, user_id, status").eq("id", document_id).single().execute()
+            )
+            doc = doc_response.data if doc_response else None
+            if not doc or doc.get("status") != "completed":
+                logger.info(f"Document {document_id}: Skipping quiz gen (status={doc.get('status') if doc else 'missing'})")
+                return
+
+            user_id = doc.get("user_id")
+            if not user_id or not isinstance(user_id, str):
+                logger.warning(f"Document {document_id}: No user_id, skipping quiz generation")
+                return
+
+            logger.info(f"Document {document_id}: Starting quiz generation...")
+            quiz_id = await asyncio.wait_for(
+                self.quiz_service.generate_quiz_for_document(
+                    document_id=document_id,
+                    user_id=user_id,
+                ),
+                timeout=QUIZ_GENERATION_TIMEOUT,
+            )
+            if quiz_id:
+                logger.info(f"Document {document_id}: Quiz {quiz_id} generated successfully")
+            else:
+                logger.warning(f"Document {document_id}: Quiz generation returned None (no questions?)")
+        except asyncio.TimeoutError:
+            logger.error(f"Document {document_id}: Quiz generation timed out after {QUIZ_GENERATION_TIMEOUT}s (document remains completed)")
+        except Exception as e:
+            logger.error(f"Document {document_id}: Quiz generation failed: {e} (document remains completed)")
 
     async def _process_document_internal(self, document_id: str):
-        """Internal processing logic with proper async handling."""
+        """
+        Internal processing logic: extraction + analysis only.
+        Quiz generation is handled separately by _generate_quiz_safe.
+        """
         try:
             logger.info(f"Starting processing for document {document_id}")
 
@@ -135,7 +182,7 @@ class ExtractionService:
 
             logger.info(f"Document {document_id}: Analysis complete - {concepts_count} concepts extracted")
 
-            # 6. Mark document as completed BEFORE quiz generation (ASYNC)
+            # 6. Mark document as completed (ASYNC)
             await run_db_operation(
                 lambda: self.supabase.table("documents").update({
                     "status": "completed",
@@ -143,21 +190,6 @@ class ExtractionService:
                 }).eq("id", document_id).execute()
             )
             logger.info(f"Document {document_id}: Status updated to 'completed'")
-
-            # 7. Generate Quiz Questions (after document is marked completed)
-            logger.info(f"Document {document_id}: Starting quiz generation...")
-            user_id = doc.get("user_id")
-            if user_id and isinstance(user_id, str):
-                quiz_id = await self.quiz_service.generate_quiz_for_document(
-                    document_id=document_id,
-                    user_id=user_id
-                )
-                if quiz_id:
-                    logger.info(f"Document {document_id}: Quiz {quiz_id} generated successfully")
-                else:
-                    logger.warning(f"Document {document_id}: Quiz generation failed, but document processing completed")
-            else:
-                logger.warning(f"Document {document_id}: No user_id found, skipping quiz generation")
 
         except ValueError as e:
             # User-friendly errors (validation, unsupported file types, etc.)
