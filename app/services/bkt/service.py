@@ -79,10 +79,10 @@ def _normalize_score(claude_score: float) -> float:
 
 
 def aggregate_pass_probability(p_list: List[float]) -> float:
-    """P(pass all) = 1 - prod(1 - pi)"""
+    """Average mastery across all skills — represents expected test score."""
     if not p_list:
         return 0.0
-    return 1.0 - prod([1.0 - _clamp01(float(p)) for p in p_list])
+    return sum(_clamp01(float(p)) for p in p_list) / len(p_list)
 
 
 async def _select(table: str, columns: str = "*", **filters) -> List[Dict[str, Any]]:
@@ -752,7 +752,11 @@ class BKTService:
                 "attempts": attempts,
             })
 
-        return {"pass_probability": aggregate_pass_probability(p_list), "skills": skills}
+        total_attempts = sum(s["attempts"] for s in skills)
+        return {
+            "pass_probability": aggregate_pass_probability(p_list) if total_attempts > 0 else None,
+            "skills": skills,
+        }
 
     @staticmethod
     async def get_weak_skills_for_course(user_id: str, course_id: str, limit: int = 5) -> Dict[str, Any]:
