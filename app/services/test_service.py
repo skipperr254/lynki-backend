@@ -430,6 +430,7 @@ async def get_pass_chance(user_id: str, course_id: str) -> Dict[str, Any]:
     return {
         "course_id": course_id,
         "pass_probability": result["pass_probability"],
+        "target_grade": result.get("target_grade", 1.0),
         "total_skills": len(result["skills"]),
         "skills": result["skills"],
     }

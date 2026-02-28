@@ -75,7 +75,8 @@ class PassChanceSkill(BaseModel):
 
 class PassChanceResponse(BaseModel):
     course_id: str
-    pass_probability: float
+    pass_probability: Optional[float] = None
+    target_grade: float = 1.0
     total_skills: int
     skills: List[PassChanceSkill]
 

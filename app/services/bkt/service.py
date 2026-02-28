@@ -17,6 +17,7 @@ and concepts. All concepts across all documents in a course share one mastery po
 from __future__ import annotations
 
 import logging
+import math
 import random
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -78,11 +79,38 @@ def _normalize_score(claude_score: float) -> float:
         return 0.0
 
 
-def aggregate_pass_probability(p_list: List[float]) -> float:
-    """Average mastery across all skills — represents expected test score."""
+def _normal_cdf(x: float) -> float:
+    """Standard normal CDF using the error function."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def aggregate_pass_probability(p_list: List[float], target: float = 1.0) -> float:
+    """
+    Probability of scoring >= target on a test covering all concepts.
+
+    Models each concept as a Bernoulli trial with probability p_i of answering
+    correctly.  The fraction-correct score has:
+        mu    = mean(p_i)
+        sigma = sqrt( sum(p_i*(1-p_i)) / N^2 )
+
+    Uses normal approximation:  P(score >= target) = 1 - Phi((target - mu) / sigma)
+    """
     if not p_list:
         return 0.0
-    return sum(_clamp01(float(p)) for p in p_list) / len(p_list)
+
+    n = len(p_list)
+    clamped = [_clamp01(float(p)) for p in p_list]
+    mu = sum(clamped) / n
+    variance = sum(p * (1.0 - p) for p in clamped) / (n * n)
+    sigma = math.sqrt(variance) if variance > 0 else 0.0
+
+    target = _clamp01(target)
+
+    if sigma == 0.0:
+        return 1.0 if mu >= target else 0.0
+
+    z = (target - mu) / sigma
+    return _clamp01(1.0 - _normal_cdf(z))
 
 
 async def _select(table: str, columns: str = "*", **filters) -> List[Dict[str, Any]]:
@@ -753,8 +781,22 @@ class BKTService:
             })
 
         total_attempts = sum(s["attempts"] for s in skills)
+
+        # Fetch the course's target_grade for the pass probability calculation
+        target_grade = 1.0
+        try:
+            course_resp = await run_db_operation(
+                lambda: _supabase.table("courses").select("target_grade").eq("id", course_id).maybe_single().execute()
+            )
+            course_data = getattr(course_resp, "data", None)
+            if course_data and course_data.get("target_grade") is not None:
+                target_grade = float(course_data["target_grade"])
+        except Exception as e:
+            logger.warning(f"Failed to fetch target_grade for course {course_id}: {e}")
+
         return {
-            "pass_probability": aggregate_pass_probability(p_list) if total_attempts > 0 else None,
+            "pass_probability": aggregate_pass_probability(p_list, target=target_grade) if total_attempts > 0 else None,
+            "target_grade": target_grade,
             "skills": skills,
         }
 
