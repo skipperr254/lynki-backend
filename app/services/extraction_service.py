@@ -1,9 +1,12 @@
 import asyncio
 import io
 import logging
-import pypdf
+import base64
+import fitz  # PyMuPDF
 import docx
 from pptx import Presentation
+from anthropic import AsyncAnthropic
+from app.core.config import get_settings
 from app.core.supabase import get_supabase
 from app.core.async_db import run_db_operation, db_storage_download
 from app.services.analysis_service import AnalysisService
@@ -17,6 +20,10 @@ logger = logging.getLogger(__name__)
 DOCUMENT_PROCESSING_TIMEOUT = 600
 # Separate timeout for quiz generation (15 minutes — AI question gen is slow for large docs)
 QUIZ_GENERATION_TIMEOUT = 900
+# Pages with fewer characters than this are treated as scanned (image-only) pages
+SCANNED_PAGE_CHAR_THRESHOLD = 50
+# Claude Vision model for OCR on images and scanned PDF pages
+VISION_MODEL = "claude-haiku-4-5-20251001"
 
 
 class ExtractionService:
@@ -25,6 +32,8 @@ class ExtractionService:
         self.bucket_name = "course-materials"
         self.analysis_service = AnalysisService()
         self.quiz_service = QuizGenerationService()
+        settings = get_settings()
+        self.vision_client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
     async def process_document(self, document_id: str):
         """
@@ -147,12 +156,7 @@ class ExtractionService:
 
             logger.info(f"Document {document_id}: Extracting text from {file_type}...")
             try:
-                # Run CPU-bound text extraction in executor
-                loop = asyncio.get_event_loop()
-                extracted_text = await loop.run_in_executor(
-                    None,
-                    lambda: self._extract_text(file_content, file_type)
-                )
+                extracted_text = await self._extract_text_async(file_content, file_type)
             except ValueError as e:
                 raise ValueError(f"Text extraction failed: {str(e)}")
 
@@ -235,19 +239,137 @@ class ExtractionService:
             lambda: self.supabase.table("documents").update({"status": status}).eq("id", document_id).execute()
         )
 
-    def _extract_text(self, file_content: bytes, file_type: str) -> str:
+    async def _extract_text_async(self, file_content: bytes, file_type: str) -> str:
         """
-        Extract text from file content. This is CPU-bound and should be run in an executor.
+        Async text extraction dispatcher. Routes to the appropriate extractor based on file type:
+        - Images (JPEG, PNG, GIF, WEBP): Claude Vision OCR
+        - PDFs (native text + scanned): _parse_pdf (hybrid)
+        - DOCX, PPTX, plain text: _extract_text_sync in executor (CPU-bound)
+        """
+        ft = file_type.lower()
+
+        if any(t in ft for t in ("jpeg", "jpg", "png", "gif", "webp", "image")):
+            media_type = self._normalize_media_type(file_type)
+            logger.info(f"Extracting text from image via Vision OCR ({media_type})")
+            text = await self._ocr_image_bytes(file_content, media_type)
+            if not text:
+                raise ValueError(
+                    "Could not extract text from the image. "
+                    "Please ensure the image contains readable text."
+                )
+            return text
+
+        if "pdf" in ft:
+            logger.info("Extracting text from PDF (with scanned-page detection)")
+            return await self._parse_pdf(file_content)
+
+        # DOCX, PPTX, plain text — synchronous, run in executor
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._extract_text_sync(file_content, file_type)
+        )
+
+    async def _parse_pdf(self, file_content: bytes) -> str:
+        """
+        Extract text from a PDF using PyMuPDF.
+        Pages with fewer than SCANNED_PAGE_CHAR_THRESHOLD characters of native text
+        are treated as scanned and processed with Claude Vision OCR.
+        """
+        loop = asyncio.get_event_loop()
+        pdf_doc = await loop.run_in_executor(
+            None, lambda: fitz.open(stream=file_content, filetype="pdf")
+        )
+        try:
+            pages_text = []
+            for page_num in range(len(pdf_doc)):
+                page = pdf_doc[page_num]
+                native_text = await loop.run_in_executor(None, page.get_text)
+
+                if len(native_text.strip()) >= SCANNED_PAGE_CHAR_THRESHOLD:
+                    pages_text.append(native_text.strip())
+                else:
+                    logger.info(
+                        f"Page {page_num + 1}: native text too short "
+                        f"({len(native_text.strip())} chars), using Vision OCR"
+                    )
+                    matrix = fitz.Matrix(2, 2)
+                    pixmap = await loop.run_in_executor(
+                        None, lambda p=page, m=matrix: p.get_pixmap(matrix=m)
+                    )
+                    png_bytes = await loop.run_in_executor(None, pixmap.tobytes, "png")
+                    ocr_text = await self._ocr_image_bytes(png_bytes, "image/png")
+                    if ocr_text:
+                        pages_text.append(ocr_text)
+                    else:
+                        logger.warning(f"Page {page_num + 1}: Vision OCR returned empty text")
+
+            return "\n\n".join(pages_text).strip()
+        finally:
+            pdf_doc.close()
+
+    async def _ocr_image_bytes(self, image_bytes: bytes, media_type: str) -> str:
+        """
+        Send image bytes to Claude Vision and return extracted text.
+        Returns empty string on failure so callers can decide how to handle it.
+        """
+        try:
+            encoded = base64.standard_b64encode(image_bytes).decode("utf-8")
+            response = await self.vision_client.messages.create(
+                model=VISION_MODEL,
+                max_tokens=4096,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": encoded,
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Extract all text from this image exactly as it appears. "
+                                    "Preserve paragraph breaks. "
+                                    "Output only the extracted text, no commentary."
+                                ),
+                            },
+                        ],
+                    }
+                ],
+            )
+            return response.content[0].text.strip()
+        except Exception as e:
+            logger.warning(f"Vision OCR failed: {e}")
+            return ""
+
+    @staticmethod
+    def _normalize_media_type(file_type: str) -> str:
+        """Map a file_type string to a Claude Vision-compatible media type."""
+        ft = file_type.lower()
+        if "jpeg" in ft or "jpg" in ft:
+            return "image/jpeg"
+        if "png" in ft:
+            return "image/png"
+        if "gif" in ft:
+            return "image/gif"
+        if "webp" in ft:
+            return "image/webp"
+        raise ValueError(f"Unsupported image media type: {file_type}")
+
+    def _extract_text_sync(self, file_content: bytes, file_type: str) -> str:
+        """
+        Synchronous text extraction for DOCX, PPTX, and plain text.
+        Intended to run in an executor (CPU-bound).
         """
         text = ""
         file_stream = io.BytesIO(file_content)
 
-        if "pdf" in file_type:
-            pdf_reader = pypdf.PdfReader(file_stream)
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
-
-        elif "word" in file_type or "docx" in file_type:
+        if "word" in file_type or "docx" in file_type:
             # application/vnd.openxmlformats-officedocument.wordprocessingml.document
             doc = docx.Document(file_stream)
 
