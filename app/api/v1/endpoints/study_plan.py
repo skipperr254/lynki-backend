@@ -28,7 +28,7 @@ async def generate_study_plan_endpoint(request: StudyPlanGenerateRequest):
             course_id=request.course_id,
         )
         return StudyPlanGenerateResponse(
-            plan_text=result["plan_text"],
+            plan_json=result["plan_json"],
             generated_at=result["generated_at"],
         )
     except ValueError as e:
