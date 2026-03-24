@@ -24,17 +24,24 @@ async def get_session(
     user_id: str,
     course_id: str,
     topic_id: Optional[str] = Query(None, description="Scope session to a specific topic"),
+    concept_ids: Optional[str] = Query(None, description="Comma-separated concept UUIDs for a targeted session"),
 ):
     """
     Get an adaptive study session for a course.
-    Returns questions selected via weighted random from unmastered concepts
-    across all documents in the course.
+    Returns questions selected via weighted random from unmastered concepts.
+    Priority: concept_ids > topic_id > whole course.
     """
     try:
+        concept_id_list = (
+            [c.strip() for c in concept_ids.split(",") if c.strip()]
+            if concept_ids
+            else None
+        )
         result = await BKTService.get_next_session(
             user_id=user_id,
             course_id=course_id,
             topic_id=topic_id,
+            concept_ids=concept_id_list,
         )
         return result
     except Exception as e:

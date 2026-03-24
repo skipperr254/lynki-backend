@@ -362,12 +362,13 @@ class BKTService:
         user_id: str,
         course_id: str,
         topic_id: Optional[str] = None,
+        concept_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Build an adaptive study session for a course.
 
         Algorithm:
-        1. Fetch concepts (scoped to topic_id if provided, else whole course).
+        1. Fetch concepts (scoped to concept_ids > topic_id > whole course).
         2. For each concept, read BKT mastery (default if no row).
         3. Filter out fully mastered concepts (p_mastery >= MASTERY_THRESHOLD).
         4. Weighted random selection: weight = (1 - p_mastery). Lower mastery -> higher chance.
@@ -377,7 +378,15 @@ class BKTService:
         8. Return session payload (questions WITHOUT correct answers for the client).
         """
         # 1. Get concepts
-        if topic_id:
+        if concept_ids:
+            all_concepts = await run_db_operation(
+                lambda: _supabase.table("concepts")
+                .select("id, name, explanation, complexity_level, topic_id")
+                .in_("id", concept_ids)
+                .execute()
+            )
+            all_concepts = getattr(all_concepts, "data", None) or []
+        elif topic_id:
             all_concepts = await _select(
                 "concepts", "id, name, explanation, complexity_level, topic_id",
                 topic_id=topic_id,
