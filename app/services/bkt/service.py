@@ -284,6 +284,35 @@ class BKTService:
         return rows[0]
 
     @staticmethod
+    async def update_mastery_for_concept(
+        user_id: str,
+        course_id: str,
+        concept_id: str,
+        is_correct: bool,
+    ) -> Dict[str, Any]:
+        """
+        Update BKT mastery for a concept directly (no question_id needed).
+        Used by topic quiz sessions whose questions are not in the questions table.
+        """
+        q = 1.0 if is_correct else 0.0
+        row = await BKTService._ensure_mastery_row(user_id, course_id, concept_id)
+        p_before = float(row.get("p_mastery", DEFAULTS["p_mastery"]))
+        params = BKTParams(
+            p_learn=float(row.get("p_transit", DEFAULTS["p_transit"])),
+            p_guess=float(row.get("p_guess", DEFAULTS["p_guess"])),
+            p_slip=float(row.get("p_slip", DEFAULTS["p_slip"])),
+        )
+        p_after, _ = soft_evidence_update(p_before, q, params)
+        new_attempts = int(row.get("n_attempts") or 0) + 1
+        new_correct = int(row.get("n_correct") or 0) + (1 if is_correct else 0)
+        await _update(
+            "bkt_mastery",
+            {"p_mastery": p_after, "n_attempts": new_attempts, "n_correct": new_correct},
+            id=str(row["id"]),
+        )
+        return {"p_mastery_before": p_before, "p_mastery_after": p_after}
+
+    @staticmethod
     async def update_mastery_for_response(
         user_id: str,
         question_id: str,
