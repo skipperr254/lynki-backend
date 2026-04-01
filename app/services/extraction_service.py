@@ -161,7 +161,10 @@ class ExtractionService:
                 raise ValueError(f"Text extraction failed: {str(e)}")
 
             if not extracted_text or len(extracted_text.strip()) < 50:
-                raise ValueError("Extracted text is too short or empty. Please upload a document with more content.")
+                raise ValueError(
+                    "This document has too little text to work with. "
+                    "Try uploading a more complete version."
+                )
 
             # Save extracted text immediately so it's not lost if analysis fails (ASYNC)
             await run_db_operation(
@@ -177,12 +180,18 @@ class ExtractionService:
                 await self.analysis_service.analyze_document(document_id, extracted_text)
             except Exception as e:
                 logger.error(f"Document {document_id}: Analysis failed - {str(e)}")
-                raise ValueError(f"AI analysis failed: {str(e)}")
+                raise ValueError(
+                    "We had trouble reading this document's content. "
+                    "Please try again — or try uploading a different file format."
+                )
 
             # Verify concepts were created (ASYNC)
             concepts_count = await self._count_document_concepts(document_id)
             if concepts_count == 0:
-                raise ValueError("No concepts could be extracted from the document. The content may not be suitable for quiz generation.")
+                raise ValueError(
+                    "This document doesn't have enough learning material for PassAI to work with. "
+                    "Try uploading a more detailed version."
+                )
 
             logger.info(f"Document {document_id}: Analysis complete - {concepts_count} concepts extracted")
 
