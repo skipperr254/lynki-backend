@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_ROLE_KEY: str  # Critical for bypassing RLS during processing
     ANTHROPIC_API_KEY: str
+    SENTRY_DSN: str = ""
 
     API_V1_STR: str = "/api/v1"
     PROJECT_NAME: str = "Lynki Backend"
