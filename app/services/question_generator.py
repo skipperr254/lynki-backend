@@ -22,7 +22,7 @@ class QuestionGenerator:
     
     def __init__(self):
         self.client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-        self.model = "claude-sonnet-4-20250514"  # Latest Sonnet for quality
+        self.model = "claude-sonnet-4-6"  # Latest Sonnet for quality
         
     async def generate_questions_for_concept(
         self,

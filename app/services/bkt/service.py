@@ -843,3 +843,125 @@ class BKTService:
         mastery = await BKTService.get_mastery_for_course(user_id, course_id)
         weakest = sorted(mastery["skills"], key=lambda s: float(s["mastery"]))[:limit]
         return {"skills": weakest}
+
+    @staticmethod
+    async def apply_soft_evidence(
+        user_id: str,
+        course_id: str,
+        topic_id: str,
+        kc_ids: List[str],
+        recall_results: Optional[List[Dict[str, Any]]] = None,
+        active_recall_evaluation: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Apply non-quiz study evidence as a soft mastery nudge.
+
+        Called by /topic-tending/complete when the quiz stage was skipped.
+        A student who self-rates "got it" on recall cards and writes a coherent
+        active-recall response has demonstrated some learning — but this signal
+        is meaningfully weaker than a real quiz answer.
+
+        Algorithm:
+          1. Combine recall card ratings and active-recall score into a single
+             evidence strength value in [0, 1].
+          2. Identify the topic's 1–2 weakest KCs (lowest current p_mastery).
+          3. For each, run a BKT soft-evidence update using REDUCED learning rate
+             (p_learn * 0.3) so this is weaker than a real quiz answer.
+          4. Persist updated p_mastery to bkt_mastery — does NOT increment
+             n_attempts / n_correct (those counters reflect quiz performance only).
+
+        The 0.3 multiplier on p_learn limits how much tending alone can move
+        the needle — students can't game the system by clicking "got it" without
+        really knowing the material.
+        """
+        # ── 1. Compute combined evidence strength ────────────────────────────
+        recall_list = recall_results or []
+        cards_total = len(recall_list)
+        cards_correct = sum(1 for r in recall_list if r.get("got_it") or r.get("rating") == "got_it")
+
+        card_score = (cards_correct / cards_total) if cards_total > 0 else 0.0
+
+        eval_score = 0.0
+        if active_recall_evaluation:
+            # Evaluation may come as { got_right: [...], missed: [...] }
+            got_right = active_recall_evaluation.get("got_right", [])
+            missed = active_recall_evaluation.get("missed", [])
+            total_concepts = len(got_right) + len(missed)
+            if total_concepts > 0:
+                eval_score = len(got_right) / total_concepts
+            # Alternatively a numeric score field may be present
+            if "score" in active_recall_evaluation:
+                try:
+                    eval_score = float(active_recall_evaluation["score"])
+                except (TypeError, ValueError):
+                    pass
+
+        # Weighted average: recall cards and active-recall have equal weight.
+        evidence = card_score * 0.5 + eval_score * 0.5
+
+        if evidence <= 0.0:
+            logger.debug(
+                "apply_soft_evidence: zero evidence for user=%s topic=%s — skipping BKT update",
+                user_id,
+                topic_id,
+            )
+            return
+
+        # ── 2. Find the 1–2 weakest KCs for this topic ───────────────────────
+        mastery_rows = await _select(
+            "bkt_mastery", "*",
+            user_id=user_id, course_id=course_id,
+        )
+        mastery_map: Dict[str, Dict[str, Any]] = {
+            r["knowledge_component_id"]: r for r in mastery_rows
+        }
+
+        kc_with_mastery: List[Tuple[str, float]] = []
+        for kc_id in kc_ids:
+            row = mastery_map.get(kc_id)
+            p = float(row["p_mastery"]) if row else DEFAULTS["p_mastery"]
+            kc_with_mastery.append((kc_id, p))
+
+        # Sort ascending → weakest first; take up to 2
+        kc_with_mastery.sort(key=lambda x: x[1])
+        targets = kc_with_mastery[:2]
+
+        # ── 3. Apply attenuated BKT update to each target KC ─────────────────
+        ATTENUATION = 0.3  # reduces p_learn to 30% of its normal value
+
+        for kc_id, _ in targets:
+            try:
+                row = mastery_map.get(kc_id)
+                if row is None:
+                    # Ensure the row exists (upsert with defaults)
+                    row = await BKTService._ensure_mastery_row(user_id, course_id, kc_id)
+
+                p_before = float(row.get("p_mastery", DEFAULTS["p_mastery"]))
+                p_learn_raw = float(row.get("p_transit", DEFAULTS["p_transit"]))
+
+                # Attenuate the learning rate so soft evidence is weaker than a quiz
+                attenuated_params = BKTParams(
+                    p_learn=p_learn_raw * ATTENUATION,
+                    p_guess=float(row.get("p_guess", DEFAULTS["p_guess"])),
+                    p_slip=float(row.get("p_slip", DEFAULTS["p_slip"])),
+                )
+
+                p_after, debug = soft_evidence_update(p_before, evidence, attenuated_params)
+
+                logger.debug(
+                    "apply_soft_evidence: kc=%s evidence=%.3f p_before=%.4f p_after=%.4f debug=%s",
+                    kc_id, evidence, p_before, p_after, debug,
+                )
+
+                # Persist — intentionally NOT incrementing n_attempts/n_correct
+                await _update(
+                    "bkt_mastery",
+                    {"p_mastery": p_after},
+                    id=str(row["id"]),
+                )
+
+            except Exception as exc:  # noqa: BLE001
+                # Soft-evidence is best-effort — never fail the session completion
+                logger.warning(
+                    "apply_soft_evidence: failed to update kc=%s: %s", kc_id, exc
+                )
