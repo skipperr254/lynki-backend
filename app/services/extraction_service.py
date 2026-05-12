@@ -23,7 +23,7 @@ QUIZ_GENERATION_TIMEOUT = 900
 # Pages with fewer characters than this are treated as scanned (image-only) pages
 SCANNED_PAGE_CHAR_THRESHOLD = 50
 # Claude Vision model for OCR on images and scanned PDF pages
-VISION_MODEL = "claude-haiku-4-5-20251001"
+VISION_MODEL = "claude-sonnet-4-6"
 
 
 class ExtractionService:

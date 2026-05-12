@@ -121,7 +121,7 @@ async def _generate_quiz_name(concept_names: List[str]) -> str:
             "'Into the Nervous System'. Return only the title, nothing else."
         )
         response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-6",
             max_tokens=40,
             messages=[{"role": "user", "content": prompt}],
         )

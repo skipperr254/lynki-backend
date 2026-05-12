@@ -22,7 +22,7 @@ class AnalysisService:
     def __init__(self):
         self.supabase = get_supabase()
         self.client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-        self.model = "claude-3-haiku-20240307"  # Using Haiku for speed/cost
+        self.model = "claude-sonnet-4-6"  # Using Sonnet
 
     async def analyze_document(self, document_id: str, text: str):
         """
