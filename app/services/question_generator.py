@@ -30,7 +30,8 @@ class QuestionGenerator:
         concept_name: str,
         concept_explanation: str,
         source_text: str,
-        num_questions: int = 3
+        num_questions: int = 3,
+        question_format: str = "standard"
     ) -> List[GeneratedQuestion]:
         """
         Generate multiple high-quality questions for a single concept.
@@ -60,7 +61,8 @@ class QuestionGenerator:
                     source_text=source_text,
                     difficulty=difficulty,
                     question_number=i + 1,
-                    total_questions=num_questions
+                    total_questions=num_questions,
+                    question_format=question_format
                 )
                 
                 if question:
@@ -105,19 +107,21 @@ class QuestionGenerator:
         source_text: str,
         difficulty: str,
         question_number: int,
-        total_questions: int
+        total_questions: int,
+        question_format: str = "standard"
     ) -> GeneratedQuestion | None:
         """Generate a single question with retries and timeout handling."""
         for attempt in range(MAX_API_RETRIES + 1):
             try:
-                system_prompt = self._build_system_prompt(difficulty)
+                system_prompt = self._build_system_prompt(difficulty, question_format)
                 user_message = self._build_user_message(
                     concept_name=concept_name,
                     concept_explanation=concept_explanation,
                     source_text=source_text,
                     difficulty=difficulty,
                     question_number=question_number,
-                    total_questions=total_questions
+                    total_questions=total_questions,
+                    question_format=question_format
                 )
 
                 # Use asyncio.wait_for for timeout handling
@@ -141,7 +145,9 @@ class QuestionGenerator:
                 
                 # Parse and validate
                 question_data = self._parse_question_response(response_text)
-                question = self._create_question_object(question_data, concept_id, difficulty)
+                question = self._create_question_object(
+                    question_data, concept_id, difficulty, question_format
+                )
                 
                 # Validate quality
                 if self._validate_question_quality(question):
@@ -175,7 +181,7 @@ class QuestionGenerator:
 
         return None
     
-    def _build_system_prompt(self, difficulty: str) -> str:
+    def _build_system_prompt(self, difficulty: str, question_format: str = "standard") -> str:
         """Build the system prompt for question generation."""
         difficulty_guides = {
             "easy": (
@@ -198,12 +204,31 @@ class QuestionGenerator:
             )
         }
         
+        format_instructions = ""
+        if question_format == "explanatory":
+            format_instructions = """
+EXPLANATORY FORMAT RULES:
+- Generate EXACTLY 3 options (not 4).
+- Each option MUST be a 50-150 word paragraph explaining a position or reasoning.
+- Exactly ONE option is correct. The other two should encode common misconceptions.
+- Options should be teaching the concept while the student evaluates them.
+- Include a "post_answer_summary" field with a 2-3 sentence textbook explanation.
+"""
+        else:
+            format_instructions = """
+STANDARD FORMAT RULES:
+- EXACTLY 4 options (A, B, C, D).
+- Options are concise (single sentences).
+"""
+
         return f"""You are an expert educational assessment designer specializing in creating high-quality exam questions.
 
 Your task is to create ONE multiple-choice question based on the provided concept and source material.
 
 DIFFICULTY LEVEL: {difficulty.upper()}
 {difficulty_guides[difficulty]}
+
+{format_instructions}
 
 CRITICAL QUALITY REQUIREMENTS:
 1. **Clear and Unambiguous**: Question should have ONE definitively correct answer
@@ -214,39 +239,22 @@ CRITICAL QUALITY REQUIREMENTS:
 
 OUTPUT FORMAT (MUST be valid JSON):
 {{
-  "question": "Clear, specific question text (no vague wording)",
+  "question": "Clear, specific question text",
   "options": [
     {{
-      "text": "Option A text",
+      "text": "Option text (paragraph if explanatory, concise if standard)",
       "is_correct": true,
-      "explanation": "Detailed explanation of why this is correct, referencing source material"
+      "explanation": "Why this is correct/incorrect in this specific case"
     }},
-    {{
-      "text": "Option B text",
-      "is_correct": false,
-      "explanation": "Specific explanation of why this is incorrect and what misconception it represents"
-    }},
-    {{
-      "text": "Option C text",
-      "is_correct": false,
-      "explanation": "Specific explanation of why this is incorrect"
-    }},
-    {{
-      "text": "Option D text",
-      "is_correct": false,
-      "explanation": "Specific explanation of why this is incorrect"
-    }}
+    ...
   ],
-  "hint": "Subtle hint that guides thinking without revealing the answer"
+  "hint": "Subtle hint",
+  "post_answer_summary": "Canonical explanation (REQUIRED for explanatory format)"
 }}
 
 RULES:
-- EXACTLY 4 options (A, B, C, D)
-- EXACTLY 1 correct answer
 - NO "All of the above" or "None of the above"
 - NO "Both A and B" compound options
-- Each explanation must be 1-3 sentences
-- Hint should prompt reflection, not give away the answer
 - Output ONLY valid JSON, no markdown formatting"""
     
     def _build_user_message(
@@ -256,7 +264,8 @@ RULES:
         source_text: str,
         difficulty: str,
         question_number: int,
-        total_questions: int
+        total_questions: int,
+        question_format: str = "standard"
     ) -> str:
         """Build the user message with concept details."""
         return f"""Create question {question_number} of {total_questions} ({difficulty} difficulty):
@@ -269,7 +278,7 @@ CONCEPT EXPLANATION:
 SOURCE MATERIAL:
 {source_text[:1500]}
 
-Generate ONE high-quality {difficulty}-level multiple-choice question that tests this concept."""
+Generate ONE high-quality {difficulty}-level multiple-choice question in {question_format} format that tests this concept."""
     
     def _parse_question_response(self, response_text: str) -> Dict[str, Any]:
         """Parse and clean the JSON response."""
@@ -296,13 +305,18 @@ Generate ONE high-quality {difficulty}-level multiple-choice question that tests
         self,
         question_data: Dict[str, Any],
         concept_id: str,
-        difficulty: str
+        difficulty: str,
+        question_format: str = "standard"
     ) -> GeneratedQuestion:
         """Convert parsed JSON to GeneratedQuestion object."""
         options_data = question_data.get("options", [])
         
-        if len(options_data) != 4:
-            raise ValueError(f"Expected 4 options, got {len(options_data)}")
+        expected_options = 3 if question_format == "explanatory" else 4
+        if len(options_data) != expected_options:
+            logging.warning(f"Expected {expected_options} options, got {len(options_data)}")
+            # We'll try to proceed if we have at least 2
+            if len(options_data) < 2:
+                 raise ValueError(f"Too few options: {len(options_data)}")
         
         options = []
         for i, opt in enumerate(options_data):
@@ -323,7 +337,9 @@ Generate ONE high-quality {difficulty}-level multiple-choice question that tests
             options=options,
             hint=question_data.get("hint"),
             difficulty_level=difficulty,  # type: ignore[arg-type]
-            concept_id=concept_id
+            concept_id=concept_id,
+            question_format=question_format,  # type: ignore[arg-type]
+            post_answer_summary=question_data.get("post_answer_summary")
         )
     
     def _validate_question_quality(self, question: GeneratedQuestion) -> bool:

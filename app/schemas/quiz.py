@@ -20,6 +20,8 @@ class GeneratedQuestion(BaseModel):
     hint: Optional[str] = None
     difficulty_level: Literal["easy", "medium", "hard"] = "medium"
     concept_id: str  # Link to knowledge component
+    question_format: Literal["standard", "explanatory"] = "standard"
+    post_answer_summary: Optional[str] = None  # Shown after answer, regardless of right/wrong
 
 
 class QuizGenerationRequest(BaseModel):

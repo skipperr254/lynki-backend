@@ -64,6 +64,8 @@ def _strip_correct(question: dict) -> dict:
     return q
 
 
+
+
 class TopicQuizService:
 
     @staticmethod
@@ -71,6 +73,7 @@ class TopicQuizService:
         user_id: str,
         course_id: str,
         topic_id: str,
+        question_format: str = "standard",
     ) -> dict[str, Any]:
         """
         Return an active (in_progress) session if one exists, otherwise generate
@@ -95,7 +98,9 @@ class TopicQuizService:
             return _public_session(session)
 
         # No active session — generate a new one
-        return await TopicQuizService._generate_session(db, user_id, course_id, topic_id)
+        return await TopicQuizService._generate_session(
+            db, user_id, course_id, topic_id, question_format
+        )
 
     @staticmethod
     async def _generate_session(
@@ -103,6 +108,7 @@ class TopicQuizService:
         user_id: str,
         course_id: str,
         topic_id: str,
+        question_format: str,
     ) -> dict[str, Any]:
         # 1. Fetch topic name
         topic_row = db.table("topics").select("name").eq("id", topic_id).single().execute()
@@ -138,6 +144,7 @@ class TopicQuizService:
                 concept_explanation=concept.get("explanation") or "",
                 source_text=concept.get("source_text") or "",
                 num_questions=num_q,
+                question_format=question_format,
             )
             for gq in generated:
                 # Shuffle options so the correct answer isn't always first
@@ -163,6 +170,8 @@ class TopicQuizService:
                     "difficulty": gq.difficulty_level,
                     "hint": gq.hint,
                     "options": options,
+                    "question_format": gq.question_format,
+                    "post_answer_summary": gq.post_answer_summary,
                 })
 
         if not all_questions:

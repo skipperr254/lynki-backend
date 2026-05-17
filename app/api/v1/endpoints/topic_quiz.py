@@ -19,14 +19,18 @@ class CompleteRequest(BaseModel):
 
 
 @router.get("/session/{user_id}/{course_id}/{topic_id}")
-async def get_or_create_session(user_id: str, course_id: str, topic_id: str):
+async def get_or_create_session(
+    user_id: str, course_id: str, topic_id: str, format: str = "standard"
+):
     """
     Return an active (in_progress) topic quiz session if one exists.
     Otherwise generate a fresh quiz for the topic and return the new session.
     Questions are stripped of is_correct before being sent to the client.
     """
     try:
-        return await TopicQuizService.get_or_create_session(user_id, course_id, topic_id)
+        return await TopicQuizService.get_or_create_session(
+            user_id, course_id, topic_id, format
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

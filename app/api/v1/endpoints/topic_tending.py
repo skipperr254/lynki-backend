@@ -34,6 +34,7 @@ from app.schemas.topic_tending import (
     KCDelta,
 )
 from app.services.bkt.service import BKTService, DEFAULTS
+from app.services.tending_service import TendingService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -137,15 +138,16 @@ async def _get_kc_breakdown_for_topic(
 @router.post("/generate", response_model=GenerateResponsePayload)
 async def generate_tending_session(req: GenerateRequest):
     """
-    TODO (Erik — PR): Fetch BKT mastery + topic content, call Sonnet 4.6 to
+    Fetch BKT mastery + topic content, call Sonnet 4.6 to
     generate recall cards, mnemonics, active-recall prompt, concept pairs.
     Insert a row into topic_tending_sessions and return the generated payload.
-
-    The session row must be created HERE so that /complete can look it up later.
-    Required columns to set on insert:
-      user_id, course_id, topic_id, generated_content, mastery_before, current_step
     """
-    raise HTTPException(status_code=501, detail="Not implemented yet — Erik's PR pending")
+    try:
+        service = TendingService()
+        return await service.generate_session(req.user_id, req.course_id, req.topic_id)
+    except Exception as e:
+        logger.error(f"Error generating tending session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─── POST /evaluate-recall ────────────────────────────────────────────────────
@@ -154,12 +156,27 @@ async def generate_tending_session(req: GenerateRequest):
 @router.post("/evaluate-recall", response_model=EvaluateRecallResponse)
 async def evaluate_recall(req: EvaluateRecallRequest):
     """
-    TODO (Erik — PR): Look up the source_paragraph from generated_content,
+    Look up the source_paragraph from generated_content,
     call Sonnet 4.6 to compare student_response against it.
     Return matched concepts (got_right) and missed concepts plus source_paragraph.
     Persist to active_recall_input and active_recall_evaluation columns.
     """
-    raise HTTPException(status_code=501, detail="Not implemented yet — Erik's PR pending")
+    try:
+        service = TendingService()
+        result = await service.evaluate_recall(req.session_id, req.student_response)
+
+        # Persist to active_recall_input and active_recall_evaluation
+        await run_db_operation(
+            lambda: _supabase.table("topic_tending_sessions").update({
+                "active_recall_input": req.student_response,
+                "active_recall_evaluation": result
+            }).eq("id", req.session_id).execute()
+        )
+
+        return result
+    except Exception as e:
+        logger.error(f"Error evaluating recall: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─── POST /complete ───────────────────────────────────────────────────────────
