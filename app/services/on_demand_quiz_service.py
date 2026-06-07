@@ -19,6 +19,9 @@ from app.core.supabase import get_supabase
 from app.core.async_db import run_db_operation
 from app.services.question_generator import QuestionGenerator
 
+# B2: how many prior question stems to load as an exclusion list
+_MAX_PRIOR_STEMS = 30
+
 logger = logging.getLogger(__name__)
 
 _supabase = get_supabase()
@@ -33,14 +36,23 @@ DEFAULT_QUIZ_SIZE = 10
 # DB helpers
 # ---------------------------------------------------------------------------
 
-async def _get_concepts_for_course(course_id: str) -> List[Dict[str, Any]]:
-    docs_resp = await run_db_operation(
-        lambda: _supabase.table("documents")
-        .select("id")
-        .eq("course_id", course_id)
-        .eq("status", "completed")
-        .execute()
-    )
+async def _get_concepts_for_course(
+    course_id: str,
+    document_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return all concepts for a course (or a single document when document_id is given)."""
+    def _docs_query():
+        q = (
+            _supabase.table("documents")
+            .select("id")
+            .eq("course_id", course_id)
+            .eq("status", "completed")
+        )
+        if document_id:
+            q = q.eq("id", document_id)
+        return q.execute()
+
+    docs_resp = await run_db_operation(_docs_query)
     docs = getattr(docs_resp, "data", None) or []
     if not docs:
         return []
@@ -76,6 +88,34 @@ async def _get_mastery_map(user_id: str, course_id: str) -> Dict[str, float]:
     )
     rows = getattr(resp, "data", None) or []
     return {r["knowledge_component_id"]: r["p_mastery"] for r in rows}
+
+
+async def _get_prior_question_stems(user_id: str, course_id: str) -> List[str]:
+    """Return recent question texts already shown to this user for the course.
+
+    Used as an exclusion list so the generator avoids repeating questions the
+    user has already seen.  Capped at _MAX_PRIOR_STEMS to keep prompt size small.
+    """
+    quiz_resp = await run_db_operation(
+        lambda: _supabase.table("course_quizzes")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("course_id", course_id)
+        .execute()
+    )
+    quiz_ids = [q["id"] for q in (getattr(quiz_resp, "data", None) or [])]
+    if not quiz_ids:
+        return []
+
+    q_resp = await run_db_operation(
+        lambda: _supabase.table("questions")
+        .select("question")
+        .in_("course_quiz_id", quiz_ids)
+        .order("created_at", desc=True)
+        .limit(_MAX_PRIOR_STEMS)
+        .execute()
+    )
+    return [r["question"] for r in (getattr(q_resp, "data", None) or [])]
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +180,7 @@ async def _generate_and_save_question(
     concept: Dict[str, Any],
     quiz_id: str,
     semaphore: asyncio.Semaphore,
+    excluded_questions: Optional[List[str]] = None,
 ) -> Optional[str]:
     """Generate 1 question for a concept, save it to DB. Returns question_id or None."""
     async with semaphore:
@@ -150,6 +191,7 @@ async def _generate_and_save_question(
                 concept_explanation=concept.get("explanation") or "",
                 source_text=concept.get("source_text") or "",
                 num_questions=1,
+                excluded_questions=excluded_questions or [],
             )
             if not questions:
                 logger.warning(f"No question generated for concept: {concept['name']}")
@@ -210,16 +252,20 @@ async def generate_quiz(
     user_id: str,
     course_id: str,
     quiz_size: int = DEFAULT_QUIZ_SIZE,
+    document_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Generate a fresh named quiz for a user+course.
+    Generate a fresh named quiz for a user+course (or a single document).
 
     Returns {quiz_id, name, total_questions, course_id}.
     The caller is responsible for starting an attempt via quiz_attempts_service.
     """
-    logger.info(f"Generating quiz: user={user_id} course={course_id} size={quiz_size}")
+    logger.info(
+        f"Generating quiz: user={user_id} course={course_id} size={quiz_size}"
+        + (f" document={document_id}" if document_id else "")
+    )
 
-    concepts = await _get_concepts_for_course(course_id)
+    concepts = await _get_concepts_for_course(course_id, document_id)
     if not concepts:
         return {
             "quiz_id": None,
@@ -231,6 +277,7 @@ async def generate_quiz(
 
     mastery_map = await _get_mastery_map(user_id, course_id)
     selected_concepts = _select_concepts(concepts, mastery_map, quiz_size)
+    prior_stems = await _get_prior_question_stems(user_id, course_id)
 
     quiz_id = str(uuid.uuid4())
 
@@ -258,7 +305,10 @@ async def generate_quiz(
         }
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
-    tasks = [_generate_and_save_question(c, quiz_id, semaphore) for c in selected_concepts]
+    tasks = [
+        _generate_and_save_question(c, quiz_id, semaphore, prior_stems)
+        for c in selected_concepts
+    ]
     results = await asyncio.gather(*tasks)
 
     question_ids = [qid for qid in results if qid is not None]

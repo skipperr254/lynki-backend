@@ -7,6 +7,7 @@ POST /quiz-sessions/generate
   The frontend then navigates to TestPage which starts an attempt.
 """
 
+from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from app.services.on_demand_quiz_service import generate_quiz
@@ -20,6 +21,7 @@ class GenerateQuizRequest(BaseModel):
     user_id: str
     course_id: str
     quiz_size: int = Field(default=10, ge=1, le=30)
+    document_id: Optional[str] = None
 
 
 @router.post("/generate")
@@ -29,6 +31,7 @@ async def generate_quiz_endpoint(req: GenerateQuizRequest):
             user_id=req.user_id,
             course_id=req.course_id,
             quiz_size=req.quiz_size,
+            document_id=req.document_id,
         )
         if result.get("error"):
             raise HTTPException(status_code=422, detail=result["error"])

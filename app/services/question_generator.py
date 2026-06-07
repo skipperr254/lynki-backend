@@ -31,27 +31,30 @@ class QuestionGenerator:
         concept_explanation: str,
         source_text: str,
         num_questions: int = 3,
-        question_format: str = "standard"
+        question_format: str = "standard",
+        excluded_questions: List[str] | None = None,
     ) -> List[GeneratedQuestion]:
         """
         Generate multiple high-quality questions for a single concept.
-        
+
         Args:
             concept_id: UUID of the concept
             concept_name: Name of the concept
             concept_explanation: Brief explanation of the concept
             source_text: Original text from document explaining this concept
             num_questions: Number of questions to generate (default 3)
-            
+            excluded_questions: Question stems already shown to the user — model
+                will avoid repeating or closely paraphrasing these.
+
         Returns:
             List of GeneratedQuestion objects
         """
         try:
             # Determine difficulty distribution based on number of questions
             difficulties = self._get_difficulty_distribution(num_questions)
-            
+
             logging.info(f"Generating {num_questions} questions for concept: {concept_name}")
-            
+
             questions = []
             for i, difficulty in enumerate(difficulties):
                 question = await self._generate_single_question(
@@ -62,7 +65,8 @@ class QuestionGenerator:
                     difficulty=difficulty,
                     question_number=i + 1,
                     total_questions=num_questions,
-                    question_format=question_format
+                    question_format=question_format,
+                    excluded_questions=excluded_questions or [],
                 )
                 
                 if question:
@@ -108,7 +112,8 @@ class QuestionGenerator:
         difficulty: str,
         question_number: int,
         total_questions: int,
-        question_format: str = "standard"
+        question_format: str = "standard",
+        excluded_questions: List[str] | None = None,
     ) -> GeneratedQuestion | None:
         """Generate a single question with retries and timeout handling."""
         for attempt in range(MAX_API_RETRIES + 1):
@@ -121,7 +126,8 @@ class QuestionGenerator:
                     difficulty=difficulty,
                     question_number=question_number,
                     total_questions=total_questions,
-                    question_format=question_format
+                    question_format=question_format,
+                    excluded_questions=excluded_questions or [],
                 )
 
                 # Use asyncio.wait_for for timeout handling
@@ -265,10 +271,21 @@ RULES:
         difficulty: str,
         question_number: int,
         total_questions: int,
-        question_format: str = "standard"
+        question_format: str = "standard",
+        excluded_questions: List[str] | None = None,
     ) -> str:
         """Build the user message with concept details."""
-        return f"""Create question {question_number} of {total_questions} ({difficulty} difficulty):
+        exclusion_block = ""
+        if excluded_questions:
+            stems = "\n".join(
+                f"- {q[:120]}" for q in excluded_questions[:20]
+            )
+            exclusion_block = (
+                f"\nAVOID questions similar to any of these already-shown questions "
+                f"(do not repeat or closely paraphrase them):\n{stems}\n"
+            )
+
+        return f"""Create question {question_number} of {total_questions} ({difficulty} difficulty):{exclusion_block}
 
 CONCEPT: {concept_name}
 
