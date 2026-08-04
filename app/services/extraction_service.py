@@ -18,8 +18,6 @@ logger = logging.getLogger(__name__)
 
 # Maximum time allowed for document processing (extraction + analysis) (10 minutes)
 DOCUMENT_PROCESSING_TIMEOUT = 600
-# Separate timeout for quiz generation (15 minutes — AI question gen is slow for large docs)
-QUIZ_GENERATION_TIMEOUT = 900
 # Pages with fewer characters than this are treated as scanned (image-only) pages
 SCANNED_PAGE_CHAR_THRESHOLD = 50
 # Claude Vision model for OCR on images and scanned PDF pages
@@ -92,19 +90,17 @@ class ExtractionService:
                 return
 
             logger.info(f"Document {document_id}: Starting quiz generation...")
-            quiz_id = await asyncio.wait_for(
-                self.quiz_service.generate_quiz_for_document(
-                    document_id=document_id,
-                    user_id=user_id,
-                ),
-                timeout=QUIZ_GENERATION_TIMEOUT,
+            # No timeout wrapper here: generate_quiz_for_document enforces its
+            # own time budget and marks the quiz row 'failed' on timeout, so
+            # this never needs to guard against it hanging forever.
+            quiz_id = await self.quiz_service.generate_quiz_for_document(
+                document_id=document_id,
+                user_id=user_id,
             )
             if quiz_id:
                 logger.info(f"Document {document_id}: Quiz {quiz_id} generated successfully")
             else:
                 logger.warning(f"Document {document_id}: Quiz generation returned None (no questions?)")
-        except asyncio.TimeoutError:
-            logger.error(f"Document {document_id}: Quiz generation timed out after {QUIZ_GENERATION_TIMEOUT}s (document remains completed)")
         except Exception as e:
             logger.error(f"Document {document_id}: Quiz generation failed: {e} (document remains completed)")
 

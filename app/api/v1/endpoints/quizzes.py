@@ -62,9 +62,11 @@ async def trigger_quiz_generation(
                     message="Quiz generation already in progress"
                 )
 
-            # If completed, allow regeneration by deleting the old quiz
-            if status == "completed":
-                logging.info(f"Deleting existing quiz {quiz_id} for regeneration")
+            # If completed or failed, allow regeneration by deleting the old
+            # quiz first — otherwise a retry after a failure would leave the
+            # old failed row behind instead of replacing it.
+            if status in ("completed", "failed"):
+                logging.info(f"Deleting existing quiz {quiz_id} ({status}) for regeneration")
                 # Delete old questions and quiz
                 supabase.table("questions").delete().eq("quiz_id", quiz_id).execute()  # type: ignore
                 supabase.table("quizzes").delete().eq("id", quiz_id).execute()  # type: ignore

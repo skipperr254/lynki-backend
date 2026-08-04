@@ -12,6 +12,18 @@ logger = logging.getLogger(__name__)
 # Concurrency limit for parallel question generation
 MAX_CONCURRENT_GENERATIONS = 3
 
+# Hard ceiling on total questions generated per document. This bank is a
+# byproduct of the auto-quiz-on-upload step (never served to students directly
+# — see extraction_service.py) so it exists purely to signal "materials are
+# ready"; uncapped, a content-rich document can produce 100+ questions of
+# pure Sonnet spend for no product benefit.
+MAX_TOTAL_QUESTIONS_PER_DOCUMENT = 30
+
+# Overall time budget for one document's generation run. Wrapped around the
+# generation work itself (not by the caller) so a timeout is caught by this
+# function's own except block below and reliably marks the quiz 'failed'.
+QUIZ_GENERATION_TIMEOUT = 900
+
 
 class QuizGenerationService:
     """
@@ -80,87 +92,141 @@ class QuizGenerationService:
             # 4. Update status to generating (ASYNC)
             await self._update_quiz_status(quiz_id, "generating")
 
-            # 5. Generate questions for each concept (in parallel batches)
-            total_questions = 0
-            failed_concepts = []
-
-            logger.info(f"Starting parallel question generation for {len(concepts)} concepts (max {MAX_CONCURRENT_GENERATIONS} concurrent)")
-
-            # Process concepts in parallel batches
-            semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
-
-            async def process_concept(concept: Dict[str, Any], concept_index: int) -> Tuple[List[GeneratedQuestion], Optional[str]]:
-                """Process a single concept with semaphore-controlled concurrency."""
-                async with semaphore:
-                    logger.info(f"Processing concept {concept_index}/{len(concepts)}: {concept['name']}")
-                    try:
-                        # Determine number of questions dynamically
-                        num_questions = self.question_generator.calculate_questions_per_concept(
-                            concept_explanation=concept.get("explanation", ""),
-                            source_text=concept.get("source_text", ""),
-                            min_questions=min_questions_per_concept,
-                            max_questions=max_questions_per_concept
-                        )
-
-                        # Generate questions
-                        questions = await self.question_generator.generate_questions_for_concept(
-                            concept_id=concept["id"],
-                            concept_name=concept["name"],
-                            concept_explanation=concept.get("explanation", ""),
-                            source_text=concept.get("source_text", ""),
-                            num_questions=num_questions
-                        )
-
-                        if questions:
-                            return (questions, None)
-                        else:
-                            return ([], concept["name"])
-
-                    except Exception as e:
-                        logger.error(f"Failed to generate questions for concept {concept['name']}: {e}")
-                        return ([], concept["name"])
-
-            # Run all concepts in parallel with controlled concurrency
-            tasks = [
-                process_concept(concept, i + 1)
-                for i, concept in enumerate(concepts)
-            ]
-            results = await asyncio.gather(*tasks)
-
-            # Process results and save questions (ASYNC)
-            current_order_index = 0
-            for (questions, failed_concept_name) in results:
-                if failed_concept_name:
-                    failed_concepts.append(failed_concept_name)
-                    logger.warning(f"No questions generated for concept: {failed_concept_name}")
-                elif questions:
-                    saved_count = await self._save_questions(quiz_id, questions, current_order_index)
-                    current_order_index += saved_count
-                    total_questions += saved_count
-                    logger.info(f"Saved {saved_count} questions")
+            # 5. Generate questions for each concept, bounded by both a total
+            # question budget and an overall time budget. Wrapped in wait_for
+            # *here* (not by the caller) so a timeout raises inside this try
+            # block and is caught below, which reliably marks the quiz
+            # 'failed' — a timeout enforced by the caller instead would cancel
+            # this coroutine via CancelledError, which bypasses this handling.
+            total_questions = await asyncio.wait_for(
+                self._run_generation(
+                    quiz_id, concepts, min_questions_per_concept, max_questions_per_concept
+                ),
+                timeout=QUIZ_GENERATION_TIMEOUT,
+            )
 
             # 6. Update quiz status (ASYNC)
             if total_questions > 0:
                 await self._update_quiz_status(quiz_id, "completed")
-                logger.info(
-                    f"Quiz generation completed: {total_questions} questions generated "
-                    f"({len(failed_concepts)} concepts failed)"
-                )
+                logger.info(f"Quiz generation completed: {total_questions} questions generated")
             else:
-                await self._update_quiz_status(quiz_id, "failed")
+                await self._update_quiz_status(
+                    quiz_id, "failed", error_message="No questions could be generated for this document."
+                )
                 logger.error("Quiz generation failed: no questions generated")
                 return None
 
             return quiz_id
 
+        except asyncio.TimeoutError:
+            logger.error(f"Quiz generation timed out after {QUIZ_GENERATION_TIMEOUT}s for document {document_id}")
+            try:
+                if quiz_id:
+                    await self._update_quiz_status(
+                        quiz_id, "failed", error_message=f"Generation timed out after {QUIZ_GENERATION_TIMEOUT}s."
+                    )
+            except Exception:
+                pass
+            return None
+
         except Exception as e:
             logger.error(f"Quiz generation failed for document {document_id}: {e}")
             try:
                 if quiz_id:
-                    await self._update_quiz_status(quiz_id, "failed")
-            except:
+                    await self._update_quiz_status(quiz_id, "failed", error_message=str(e)[:500])
+            except Exception:
                 pass
             return None
+
+    async def _run_generation(
+        self,
+        quiz_id: str,
+        concepts: List[Dict[str, Any]],
+        min_questions_per_concept: int,
+        max_questions_per_concept: int,
+    ) -> int:
+        """
+        Generate and save questions for all concepts, in parallel batches,
+        capped at MAX_TOTAL_QUESTIONS_PER_DOCUMENT total questions.
+
+        Returns the total number of questions saved.
+        """
+        logger.info(
+            f"Starting parallel question generation for {len(concepts)} concepts "
+            f"(max {MAX_CONCURRENT_GENERATIONS} concurrent, budget {MAX_TOTAL_QUESTIONS_PER_DOCUMENT} questions)"
+        )
+
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
+        budget_lock = asyncio.Lock()
+        questions_remaining = MAX_TOTAL_QUESTIONS_PER_DOCUMENT
+
+        async def process_concept(concept: Dict[str, Any], concept_index: int) -> Tuple[List[GeneratedQuestion], Optional[str]]:
+            """Process a single concept with semaphore-controlled concurrency."""
+            nonlocal questions_remaining
+            async with semaphore:
+                # Reserve this concept's share of the total question budget
+                # up front so the cap holds regardless of concept order or
+                # how many concepts run concurrently.
+                async with budget_lock:
+                    if questions_remaining <= 0:
+                        logger.info(f"Question budget exhausted, skipping concept: {concept['name']}")
+                        return ([], None)
+
+                    num_questions = min(
+                        self.question_generator.calculate_questions_per_concept(
+                            concept_explanation=concept.get("explanation", ""),
+                            source_text=concept.get("source_text", ""),
+                            min_questions=min_questions_per_concept,
+                            max_questions=max_questions_per_concept
+                        ),
+                        questions_remaining,
+                    )
+                    questions_remaining -= num_questions
+
+                logger.info(f"Processing concept {concept_index}/{len(concepts)}: {concept['name']}")
+                try:
+                    questions = await self.question_generator.generate_questions_for_concept(
+                        concept_id=concept["id"],
+                        concept_name=concept["name"],
+                        concept_explanation=concept.get("explanation", ""),
+                        source_text=concept.get("source_text", ""),
+                        num_questions=num_questions
+                    )
+
+                    if questions:
+                        return (questions, None)
+                    else:
+                        return ([], concept["name"])
+
+                except Exception as e:
+                    logger.error(f"Failed to generate questions for concept {concept['name']}: {e}")
+                    return ([], concept["name"])
+
+        # Run all concepts in parallel with controlled concurrency
+        tasks = [
+            process_concept(concept, i + 1)
+            for i, concept in enumerate(concepts)
+        ]
+        results = await asyncio.gather(*tasks)
+
+        # Process results and save questions (ASYNC)
+        current_order_index = 0
+        total_questions = 0
+        failed_concepts = []
+        for (questions, failed_concept_name) in results:
+            if failed_concept_name:
+                failed_concepts.append(failed_concept_name)
+                logger.warning(f"No questions generated for concept: {failed_concept_name}")
+            elif questions:
+                saved_count = await self._save_questions(quiz_id, questions, current_order_index)
+                current_order_index += saved_count
+                total_questions += saved_count
+                logger.info(f"Saved {saved_count} questions")
+
+        if failed_concepts:
+            logger.info(f"{len(failed_concepts)} concept(s) failed to generate questions")
+
+        return total_questions
 
     async def _get_document(self, document_id: str) -> Optional[Dict[str, Any]]:
         """Fetch document from database (ASYNC)."""
@@ -234,13 +300,16 @@ class QuizGenerationService:
             logger.error(f"Error creating quiz: {e}")
             return None
 
-    async def _update_quiz_status(self, quiz_id: str, status: str) -> bool:
-        """Update quiz generation status (ASYNC)."""
+    async def _update_quiz_status(
+        self, quiz_id: str, status: str, error_message: Optional[str] = None
+    ) -> bool:
+        """Update quiz generation status, optionally recording why it failed (ASYNC)."""
         try:
+            update: Dict[str, Any] = {"generation_status": status}
+            if error_message is not None:
+                update["error_message"] = error_message
             await run_db_operation(
-                lambda: self.supabase.table("quizzes").update({
-                    "generation_status": status
-                }).eq("id", quiz_id).execute()
+                lambda: self.supabase.table("quizzes").update(update).eq("id", quiz_id).execute()
             )
             return True
         except Exception as e:
