@@ -11,6 +11,7 @@ import asyncio
 import logging
 import random
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
@@ -30,6 +31,16 @@ _settings = get_settings()
 
 MAX_CONCURRENT_GENERATIONS = 5
 DEFAULT_QUIZ_SIZE = 10
+
+# Wall-clock budget for the whole question-generation job. This is an
+# interactive, user-awaited flow (unlike the legacy background pipeline), so
+# the cap is tighter: whatever questions complete within the budget are kept
+# (partial success beats none), tasks still running past it are cancelled.
+QUIZ_GENERATION_TIMEOUT = 150
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -248,20 +259,25 @@ async def _generate_and_save_question(
 # Public entry point
 # ---------------------------------------------------------------------------
 
-async def generate_quiz(
+async def start_quiz_generation(
     user_id: str,
     course_id: str,
     quiz_size: int = DEFAULT_QUIZ_SIZE,
     document_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Generate a fresh named quiz for a user+course (or a single document).
+    Validate + create the course_quizzes placeholder row, then return
+    immediately. The caller (the endpoint) is responsible for scheduling
+    `run_quiz_generation_job` as a background task with the returned quiz_id —
+    this function never awaits question generation itself, so the HTTP
+    request this backs never blocks on Sonnet calls.
 
-    Returns {quiz_id, name, total_questions, course_id}.
-    The caller is responsible for starting an attempt via quiz_attempts_service.
+    Returns {quiz_id, status, course_id} on success, or {..., error} if there
+    are no concepts to generate from at all (a fast, synchronous failure —
+    no placeholder row is created in that case).
     """
     logger.info(
-        f"Generating quiz: user={user_id} course={course_id} size={quiz_size}"
+        f"Starting quiz generation: user={user_id} course={course_id} size={quiz_size}"
         + (f" document={document_id}" if document_id else "")
     )
 
@@ -269,20 +285,16 @@ async def generate_quiz(
     if not concepts:
         return {
             "quiz_id": None,
-            "name": None,
+            "status": None,
             "total_questions": 0,
             "course_id": course_id,
             "error": "No concepts found. Upload and process documents first.",
         }
 
-    mastery_map = await _get_mastery_map(user_id, course_id)
-    selected_concepts = _select_concepts(concepts, mastery_map, quiz_size)
-    prior_stems = await _get_prior_question_stems(user_id, course_id)
-
     quiz_id = str(uuid.uuid4())
 
-    # Create the course_quizzes row FIRST so questions can reference it via FK.
-    # Name and total_questions are updated after generation completes.
+    # Create the course_quizzes row FIRST so questions can reference it via
+    # FK, and so the frontend has something to poll immediately.
     try:
         await run_db_operation(
             lambda: _supabase.table("course_quizzes").insert({
@@ -292,65 +304,112 @@ async def generate_quiz(
                 "name": "Generating…",
                 "total_questions": 0,
                 "question_order": [],
+                "status": "generating",
+                "updated_at": _now_iso(),
             }).execute()
         )
     except Exception as e:
         logger.error(f"Failed to create course_quizzes placeholder: {e}")
         return {
             "quiz_id": None,
-            "name": None,
+            "status": None,
             "total_questions": 0,
             "course_id": course_id,
             "error": "Failed to save quiz. Please try again.",
         }
 
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
-    tasks = [
-        _generate_and_save_question(c, quiz_id, semaphore, prior_stems)
-        for c in selected_concepts
-    ]
-    results = await asyncio.gather(*tasks)
+    return {
+        "quiz_id": quiz_id,
+        "status": "generating",
+        "course_id": course_id,
+        "concepts": concepts,
+    }
 
-    question_ids = [qid for qid in results if qid is not None]
-    if not question_ids:
-        logger.error("Quiz generation produced no questions")
-        # Clean up the placeholder row
-        try:
-            await run_db_operation(
-                lambda: _supabase.table("course_quizzes").delete().eq("id", quiz_id).execute()
-            )
-        except Exception:
-            pass
-        return {
-            "quiz_id": None,
-            "name": None,
-            "total_questions": 0,
-            "course_id": course_id,
-            "error": "Could not generate questions. Please try again.",
-        }
 
-    random.shuffle(question_ids)
-
-    concept_names = [c["name"] for c in selected_concepts]
-    quiz_name = await _generate_quiz_name(concept_names)
-
-    # Update the row with final name, count, and question order
+async def run_quiz_generation_job(
+    quiz_id: str,
+    user_id: str,
+    course_id: str,
+    concepts: List[Dict[str, Any]],
+    quiz_size: int,
+) -> None:
+    """
+    The actual generation work, run as a background task after the HTTP
+    response for `start_quiz_generation` has already been sent. Bounded by
+    QUIZ_GENERATION_TIMEOUT; whatever questions complete within the budget
+    are kept (partial success beats none) and course_quizzes.status is always
+    left in a terminal state ('completed' or 'failed') — never stuck on
+    'generating' past this function returning.
+    """
     try:
+        mastery_map = await _get_mastery_map(user_id, course_id)
+        selected_concepts = _select_concepts(concepts, mastery_map, quiz_size)
+        prior_stems = await _get_prior_question_stems(user_id, course_id)
+
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
+        tasks = [
+            asyncio.create_task(
+                _generate_and_save_question(c, quiz_id, semaphore, prior_stems)
+            )
+            for c in selected_concepts
+        ]
+
+        done, pending = await asyncio.wait(tasks, timeout=QUIZ_GENERATION_TIMEOUT)
+        if pending:
+            logger.warning(
+                f"Quiz {quiz_id}: {len(pending)}/{len(tasks)} question generation "
+                f"task(s) still running past the {QUIZ_GENERATION_TIMEOUT}s budget — "
+                f"cancelling, keeping {len(done)} completed."
+            )
+            for t in pending:
+                t.cancel()
+
+        question_ids: List[str] = []
+        for t in done:
+            try:
+                qid = t.result()
+            except Exception as e:
+                logger.error(f"Quiz {quiz_id}: question generation task failed: {e}")
+                qid = None
+            if qid is not None:
+                question_ids.append(qid)
+
+        if not question_ids:
+            logger.error(f"Quiz {quiz_id}: generation produced no questions")
+            await run_db_operation(
+                lambda: _supabase.table("course_quizzes").update({
+                    "status": "failed",
+                    "error_message": "Could not generate questions. Please try again.",
+                    "updated_at": _now_iso(),
+                }).eq("id", quiz_id).execute()
+            )
+            return
+
+        random.shuffle(question_ids)
+
+        concept_names = [c["name"] for c in selected_concepts]
+        quiz_name = await _generate_quiz_name(concept_names)
+
         await run_db_operation(
             lambda: _supabase.table("course_quizzes").update({
                 "name": quiz_name,
                 "total_questions": len(question_ids),
                 "question_order": question_ids,
+                "status": "completed",
+                "updated_at": _now_iso(),
             }).eq("id", quiz_id).execute()
         )
+        logger.info(f"Quiz {quiz_id} '{quiz_name}' created with {len(question_ids)} questions")
+
     except Exception as e:
-        logger.error(f"Failed to update course_quizzes record: {e}")
-
-    logger.info(f"Quiz {quiz_id} '{quiz_name}' created with {len(question_ids)} questions")
-
-    return {
-        "quiz_id": quiz_id,
-        "name": quiz_name,
-        "total_questions": len(question_ids),
-        "course_id": course_id,
-    }
+        logger.error(f"Quiz {quiz_id}: generation job failed: {e}")
+        try:
+            await run_db_operation(
+                lambda: _supabase.table("course_quizzes").update({
+                    "status": "failed",
+                    "error_message": "Quiz generation failed unexpectedly. Please try again.",
+                    "updated_at": _now_iso(),
+                }).eq("id", quiz_id).execute()
+            )
+        except Exception:
+            pass

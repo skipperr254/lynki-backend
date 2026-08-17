@@ -11,6 +11,7 @@ Session lifecycle:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 import random
@@ -28,6 +29,15 @@ _Q_SMALL = 5   # <= 2 concepts
 _Q_MEDIUM = 7  # 3–5 concepts
 _Q_LARGE = 10  # > 5 concepts
 _MAX_PER_CONCEPT = 3
+
+# Concurrency limit for parallel per-concept generation (mirrors on_demand_quiz_service).
+_MAX_CONCURRENT_GENERATIONS = 5
+
+# Wall-clock budget for the whole session build. This is a synchronous,
+# user-awaited call (the endpoint awaits get_or_create_session directly), so
+# it must stay bounded rather than run open-ended — whatever concepts finish
+# in time are kept, stragglers are cancelled.
+TOPIC_QUIZ_GENERATION_TIMEOUT = 100
 
 
 def _target_count(num_concepts: int) -> int:
@@ -131,21 +141,24 @@ class TopicQuizService:
         total_target = _target_count(num_concepts)
         distribution = _distribute(num_concepts, total_target)
 
-        # 3. Generate questions per concept in parallel-ish (sequential is fine for small counts)
+        # 3. Generate questions per concept in parallel, bounded concurrency
+        # and a hard wall-clock budget for the whole build.
         generator = QuestionGenerator()
-        all_questions: list[dict] = []
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_GENERATIONS)
 
-        for concept, num_q in zip(concepts, distribution):
+        async def _generate_for_concept(concept: dict, num_q: int) -> list[dict]:
             if num_q == 0:
-                continue
-            generated = await generator.generate_questions_for_concept(
-                concept_id=concept["id"],
-                concept_name=concept["name"],
-                concept_explanation=concept.get("explanation") or "",
-                source_text=concept.get("source_text") or "",
-                num_questions=num_q,
-                question_format=question_format,
-            )
+                return []
+            async with semaphore:
+                generated = await generator.generate_questions_for_concept(
+                    concept_id=concept["id"],
+                    concept_name=concept["name"],
+                    concept_explanation=concept.get("explanation") or "",
+                    source_text=concept.get("source_text") or "",
+                    num_questions=num_q,
+                    question_format=question_format,
+                )
+            questions = []
             for gq in generated:
                 # Shuffle options so the correct answer isn't always first
                 # (Claude follows the prompt template which puts correct first)
@@ -162,7 +175,7 @@ class TopicQuizService:
                 for idx, opt in enumerate(options):
                     opt["index"] = idx
 
-                all_questions.append({
+                questions.append({
                     "id": str(uuid.uuid4()),
                     "question": gq.question,
                     "concept_id": gq.concept_id,
@@ -173,6 +186,28 @@ class TopicQuizService:
                     "question_format": gq.question_format,
                     "post_answer_summary": gq.post_answer_summary,
                 })
+            return questions
+
+        tasks = [
+            asyncio.create_task(_generate_for_concept(concept, num_q))
+            for concept, num_q in zip(concepts, distribution)
+        ]
+        done, pending = await asyncio.wait(tasks, timeout=TOPIC_QUIZ_GENERATION_TIMEOUT)
+        if pending:
+            logger.warning(
+                f"Topic {topic_id}: {len(pending)}/{len(tasks)} concept(s) still "
+                f"generating past the {TOPIC_QUIZ_GENERATION_TIMEOUT}s budget — "
+                f"cancelling, keeping results from {len(done)} completed."
+            )
+            for t in pending:
+                t.cancel()
+
+        all_questions: list[dict] = []
+        for t in done:
+            try:
+                all_questions.extend(t.result())
+            except Exception as e:
+                logger.error(f"Topic {topic_id}: concept generation task failed: {e}")
 
         if not all_questions:
             raise ValueError("Question generation produced no questions")

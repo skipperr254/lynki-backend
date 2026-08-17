@@ -1,10 +1,7 @@
-import json
 import logging
-import re
 import asyncio
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional
 from anthropic import AsyncAnthropic, APITimeoutError, APIConnectionError
-from anthropic.types import TextBlock
 from app.core.config import get_settings
 from app.schemas.quiz import GeneratedQuestion, QuestionOption
 
@@ -14,16 +11,24 @@ settings = get_settings()
 CLAUDE_TIMEOUT_SECONDS = 90  # 90 seconds for Sonnet question generation (more complex)
 MAX_API_RETRIES = 2
 
+TOOL_NAME = "submit_question"
+
+
 class QuestionGenerator:
     """
     Generates high-quality exam questions using Claude Sonnet.
     Focuses on Bloom's Taxonomy levels and real exam scenarios.
+
+    Questions are generated via a forced tool call rather than free-text JSON:
+    the schema carries a single `correct_index` instead of a per-option
+    `is_correct` flag, so "0 correct" / "2 correct" responses are structurally
+    impossible rather than merely discouraged by the prompt.
     """
-    
+
     def __init__(self):
         self.client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
         self.model = "claude-sonnet-4-6"  # Latest Sonnet for quality
-        
+
     async def generate_questions_for_concept(
         self,
         concept_id: str,
@@ -68,17 +73,17 @@ class QuestionGenerator:
                     question_format=question_format,
                     excluded_questions=excluded_questions or [],
                 )
-                
+
                 if question:
                     questions.append(question)
-                    
+
             logging.info(f"Successfully generated {len(questions)}/{num_questions} questions for {concept_name}")
             return questions
-            
+
         except Exception as e:
             logging.error(f"Failed to generate questions for concept {concept_name}: {e}")
             return []
-    
+
     def _get_difficulty_distribution(self, num_questions: int) -> List[str]:
         """
         Determine difficulty distribution based on number of questions.
@@ -99,10 +104,10 @@ class QuestionGenerator:
             easy_count = num_questions // 3
             hard_count = num_questions // 3
             medium_count = num_questions - easy_count - hard_count
-            return (["easy"] * easy_count + 
-                   ["medium"] * medium_count + 
+            return (["easy"] * easy_count +
+                   ["medium"] * medium_count +
                    ["hard"] * hard_count)
-    
+
     async def _generate_single_question(
         self,
         concept_id: str,
@@ -115,54 +120,82 @@ class QuestionGenerator:
         question_format: str = "standard",
         excluded_questions: List[str] | None = None,
     ) -> GeneratedQuestion | None:
-        """Generate a single question with retries and timeout handling."""
+        """
+        Generate a single question via a forced tool call, with a bounded
+        number of attempts. A validation failure sends the specific error back
+        to the model as a tool_result so the next attempt is a targeted
+        correction, not a blind resend of the same prompt.
+        """
+        system_prompt = self._build_system_prompt(difficulty, question_format)
+        user_message = self._build_user_message(
+            concept_name=concept_name,
+            concept_explanation=concept_explanation,
+            source_text=source_text,
+            difficulty=difficulty,
+            question_number=question_number,
+            total_questions=total_questions,
+            question_format=question_format,
+            excluded_questions=excluded_questions or [],
+        )
+        tool_schema = self._build_tool_schema(question_format)
+        messages: List[Dict[str, Any]] = [{"role": "user", "content": user_message}]
+
         for attempt in range(MAX_API_RETRIES + 1):
             try:
-                system_prompt = self._build_system_prompt(difficulty, question_format)
-                user_message = self._build_user_message(
-                    concept_name=concept_name,
-                    concept_explanation=concept_explanation,
-                    source_text=source_text,
-                    difficulty=difficulty,
-                    question_number=question_number,
-                    total_questions=total_questions,
-                    question_format=question_format,
-                    excluded_questions=excluded_questions or [],
-                )
-
-                # Use asyncio.wait_for for timeout handling
                 response = await asyncio.wait_for(
                     self.client.messages.create(
                         model=self.model,
                         max_tokens=2000,
                         system=system_prompt,
-                        messages=[{"role": "user", "content": user_message}],
-                        temperature=0.3  # Balance creativity and consistency
+                        messages=messages,
+                        temperature=0.3,  # Balance creativity and consistency
+                        tools=[tool_schema],
+                        tool_choice={"type": "tool", "name": TOOL_NAME},
                     ),
                     timeout=CLAUDE_TIMEOUT_SECONDS
                 )
-                
-                # Extract text content
-                content_block = response.content[0]
-                if not isinstance(content_block, TextBlock):
-                    raise ValueError(f"Unexpected content type: {type(content_block).__name__}")
-                
-                response_text = content_block.text
-                
-                # Parse and validate
-                question_data = self._parse_question_response(response_text)
-                question = self._create_question_object(
-                    question_data, concept_id, difficulty, question_format
+
+                tool_use_block = next(
+                    (b for b in response.content if b.type == "tool_use"), None
                 )
-                
-                # Validate quality
-                if self._validate_question_quality(question):
+                if tool_use_block is None:
+                    raise ValueError("Model response did not include a tool call")
+
+                question_data = tool_use_block.input
+
+                error: Optional[str] = None
+                question: GeneratedQuestion | None = None
+                try:
+                    question = self._create_question_object(
+                        question_data, concept_id, difficulty, question_format
+                    )
+                except (KeyError, ValueError, TypeError) as e:
+                    error = str(e)
+
+                if question is not None:
+                    error = self._validate_question_quality(question)
+
+                if question is not None and error is None:
                     return question
-                else:
-                    logging.warning(f"Question quality validation failed (attempt {attempt + 1})")
-                    if attempt < MAX_API_RETRIES:
-                        continue
-                    
+
+                logging.warning(f"Question validation failed (attempt {attempt + 1}): {error}")
+                if attempt < MAX_API_RETRIES:
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_block.id,
+                            "content": (
+                                f"Your submission was invalid: {error}. "
+                                f"Call {TOOL_NAME} again with a corrected version "
+                                "that fixes this specific issue."
+                            ),
+                            "is_error": True,
+                        }],
+                    })
+                    continue
+
             except asyncio.TimeoutError:
                 logging.error(f"Claude API timeout after {CLAUDE_TIMEOUT_SECONDS}s (attempt {attempt + 1})")
                 if attempt < MAX_API_RETRIES:
@@ -175,18 +208,81 @@ class QuestionGenerator:
                     await asyncio.sleep(2 ** attempt)
                     continue
 
-            except json.JSONDecodeError as e:
-                logging.error(f"JSON parsing error (attempt {attempt + 1}): {e}")
-                if attempt < MAX_API_RETRIES:
-                    continue
-
             except Exception as e:
                 logging.error(f"Error generating question (attempt {attempt + 1}): {e}")
                 if attempt < MAX_API_RETRIES:
                     continue
 
         return None
-    
+
+    def _build_tool_schema(self, question_format: str = "standard") -> Dict[str, Any]:
+        """
+        Tool (function-call) schema for question submission.
+
+        Correctness is carried as a single `correct_index` into `options`
+        rather than a per-option `is_correct` flag, so "0 correct" / "2+
+        correct" responses — the exact failure mode seen in production — are
+        structurally impossible to express, not just discouraged by the prompt.
+        """
+        num_options = 3 if question_format == "explanatory" else 4
+        option_text_desc = (
+            "A 50-150 word paragraph explaining a position or reasoning."
+            if question_format == "explanatory"
+            else "A concise, single-sentence answer option."
+        )
+
+        properties: Dict[str, Any] = {
+            "question": {
+                "type": "string",
+                "description": "Clear, specific question text (20-500 characters).",
+            },
+            "options": {
+                "type": "array",
+                "minItems": num_options,
+                "maxItems": num_options,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": option_text_desc},
+                        "explanation": {
+                            "type": "string",
+                            "description": "Why this option is correct or incorrect in this specific case (>= 10 characters).",
+                        },
+                    },
+                    "required": ["text", "explanation"],
+                },
+                "description": f"Exactly {num_options} answer options, in the order they should be presented.",
+            },
+            "correct_index": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": num_options - 1,
+                "description": f"0-based index into `options` of the single correct answer (0 to {num_options - 1}).",
+            },
+            "hint": {
+                "type": "string",
+                "description": "A subtle hint that doesn't give away the answer.",
+            },
+        }
+        required = ["question", "options", "correct_index", "hint"]
+
+        if question_format == "explanatory":
+            properties["post_answer_summary"] = {
+                "type": "string",
+                "description": "2-3 sentence canonical textbook explanation, shown after the student answers.",
+            }
+            required.append("post_answer_summary")
+
+        return {
+            "name": TOOL_NAME,
+            "description": "Submit one multiple-choice exam question with exactly one correct answer.",
+            "input_schema": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        }
+
     def _build_system_prompt(self, difficulty: str, question_format: str = "standard") -> str:
         """Build the system prompt for question generation."""
         difficulty_guides = {
@@ -209,16 +305,15 @@ class QuestionGenerator:
                 "- Analyze relationships and make judgments"
             )
         }
-        
+
         format_instructions = ""
         if question_format == "explanatory":
             format_instructions = """
 EXPLANATORY FORMAT RULES:
 - Generate EXACTLY 3 options (not 4).
-- Each option MUST be a 50-150 word paragraph explaining a position or reasoning.
-- Exactly ONE option is correct. The other two should encode common misconceptions.
+- Each option is a 50-150 word paragraph explaining a position or reasoning.
+- The other two options should encode common misconceptions.
 - Options should be teaching the concept while the student evaluates them.
-- Include a "post_answer_summary" field with a 2-3 sentence textbook explanation.
 """
         else:
             format_instructions = """
@@ -229,7 +324,7 @@ STANDARD FORMAT RULES:
 
         return f"""You are an expert educational assessment designer specializing in creating high-quality exam questions.
 
-Your task is to create ONE multiple-choice question based on the provided concept and source material.
+Your task is to create ONE multiple-choice question based on the provided concept and source material, then submit it via the {TOOL_NAME} tool.
 
 DIFFICULTY LEVEL: {difficulty.upper()}
 {difficulty_guides[difficulty]}
@@ -243,26 +338,10 @@ CRITICAL QUALITY REQUIREMENTS:
 4. **Realistic Distractors**: Wrong answers should be plausible but clearly incorrect
 5. **Educational Value**: Test meaningful understanding, not trivial details
 
-OUTPUT FORMAT (MUST be valid JSON):
-{{
-  "question": "Clear, specific question text",
-  "options": [
-    {{
-      "text": "Option text (paragraph if explanatory, concise if standard)",
-      "is_correct": true,
-      "explanation": "Why this is correct/incorrect in this specific case"
-    }},
-    ...
-  ],
-  "hint": "Subtle hint",
-  "post_answer_summary": "Canonical explanation (REQUIRED for explanatory format)"
-}}
-
 RULES:
 - NO "All of the above" or "None of the above"
-- NO "Both A and B" compound options
-- Output ONLY valid JSON, no markdown formatting"""
-    
+- NO "Both A and B" compound options"""
+
     def _build_user_message(
         self,
         concept_name: str,
@@ -296,28 +375,7 @@ SOURCE MATERIAL:
 {source_text[:1500]}
 
 Generate ONE high-quality {difficulty}-level multiple-choice question in {question_format} format that tests this concept."""
-    
-    def _parse_question_response(self, response_text: str) -> Dict[str, Any]:
-        """Parse and clean the JSON response."""
-        # Remove markdown code blocks if present
-        response_text = re.sub(r'^```(?:json)?\\s*', '', response_text, flags=re.MULTILINE)
-        response_text = re.sub(r'\\s*```$', '', response_text, flags=re.MULTILINE)
-        
-        # Find JSON boundaries
-        start_idx = response_text.find('{')
-        end_idx = response_text.rfind('}') + 1
-        
-        if start_idx == -1 or end_idx == 0:
-            raise ValueError("No JSON object found in response")
-        
-        json_str = response_text[start_idx:end_idx]
-        
-        # Clean common JSON issues
-        json_str = re.sub(r',\\s*}', '}', json_str)
-        json_str = re.sub(r',\\s*]', ']', json_str)
-        
-        return json.loads(json_str)
-    
+
     def _create_question_object(
         self,
         question_data: Dict[str, Any],
@@ -325,32 +383,31 @@ Generate ONE high-quality {difficulty}-level multiple-choice question in {questi
         difficulty: str,
         question_format: str = "standard"
     ) -> GeneratedQuestion:
-        """Convert parsed JSON to GeneratedQuestion object."""
+        """Convert the tool call's parsed input into a GeneratedQuestion object."""
         options_data = question_data.get("options", [])
-        
+
         expected_options = 3 if question_format == "explanatory" else 4
         if len(options_data) != expected_options:
-            logging.warning(f"Expected {expected_options} options, got {len(options_data)}")
-            # We'll try to proceed if we have at least 2
-            if len(options_data) < 2:
-                 raise ValueError(f"Too few options: {len(options_data)}")
-        
-        options = []
-        for i, opt in enumerate(options_data):
-            options.append(QuestionOption(
-                option_text=opt["text"],
+            raise ValueError(f"Expected {expected_options} options, got {len(options_data)}")
+
+        correct_index = question_data.get("correct_index")
+        if not isinstance(correct_index, int) or not (0 <= correct_index < len(options_data)):
+            raise ValueError(
+                f"correct_index {correct_index!r} is out of range for {len(options_data)} options"
+            )
+
+        options = [
+            QuestionOption(
+                option_text=opt.get("text", ""),
                 option_index=i,
-                is_correct=opt.get("is_correct", False),
-                explanation=opt.get("explanation", "")
-            ))
-        
-        # Validate exactly one correct answer
-        correct_count = sum(1 for opt in options if opt.is_correct)
-        if correct_count != 1:
-            raise ValueError(f"Expected exactly 1 correct answer, got {correct_count}")
-        
+                is_correct=(i == correct_index),
+                explanation=opt.get("explanation", ""),
+            )
+            for i, opt in enumerate(options_data)
+        ]
+
         return GeneratedQuestion(
-            question=question_data["question"],
+            question=question_data.get("question", ""),
             options=options,
             hint=question_data.get("hint"),
             difficulty_level=difficulty,  # type: ignore[arg-type]
@@ -358,39 +415,31 @@ Generate ONE high-quality {difficulty}-level multiple-choice question in {questi
             question_format=question_format,  # type: ignore[arg-type]
             post_answer_summary=question_data.get("post_answer_summary")
         )
-    
-    def _validate_question_quality(self, question: GeneratedQuestion) -> bool:
+
+    def _validate_question_quality(self, question: GeneratedQuestion) -> Optional[str]:
         """
         Validate question meets quality standards.
-        Returns True if valid, False otherwise.
+        Returns None if valid, or a description of the problem otherwise —
+        the description is fed back to the model as a targeted correction.
         """
-        # Check question text length (not too short or too long)
         if len(question.question) < 20 or len(question.question) > 500:
-            logging.warning(f"Question text length invalid: {len(question.question)}")
-            return False
-        
-        # Check all options have text
-        for opt in question.options:
+            return f"Question text length invalid: {len(question.question)} characters (must be 20-500)"
+
+        for i, opt in enumerate(question.options):
             if not opt.option_text or len(opt.option_text) < 3:
-                logging.warning("Option text too short or empty")
-                return False
+                return f"Option {i} text is too short or empty"
             if not opt.explanation or len(opt.explanation) < 10:
-                logging.warning("Option explanation too short or empty")
-                return False
-        
-        # Check options are not too similar (basic check)
+                return f"Option {i} explanation is too short or empty (must be at least 10 characters)"
+
         option_texts = [opt.option_text.lower() for opt in question.options]
         if len(set(option_texts)) != len(option_texts):
-            logging.warning("Duplicate options detected")
-            return False
-        
-        # Check hint exists and is reasonable
+            return "Two or more options have duplicate text"
+
         if question.hint and len(question.hint) < 10:
-            logging.warning("Hint too short")
-            return False
-        
-        return True
-    
+            return "Hint is too short"
+
+        return None
+
     def calculate_questions_per_concept(
         self,
         concept_explanation: str,
@@ -400,19 +449,19 @@ Generate ONE high-quality {difficulty}-level multiple-choice question in {questi
     ) -> int:
         """
         Dynamically determine number of questions based on content richness.
-        
+
         Args:
             concept_explanation: The concept's explanation
             source_text: Original source material
             min_questions: Minimum questions to generate
             max_questions: Maximum questions to generate
-            
+
         Returns:
             Number of questions to generate (between min and max)
         """
         # Calculate content richness score
         content_length = len(source_text) + len(concept_explanation)
-        
+
         # More content = more questions (simple heuristic)
         if content_length < 200:
             return min_questions

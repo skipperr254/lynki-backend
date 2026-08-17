@@ -102,7 +102,7 @@ async def start_quiz_attempt(user_id: str, quiz_id: str, course_id: str) -> Dict
     """
     quiz_resp = await run_db_operation(
         lambda: _supabase.table("course_quizzes")
-        .select("id, name")
+        .select("id, name, status, error_message")
         .eq("id", quiz_id)
         .maybe_single()
         .execute()
@@ -110,6 +110,16 @@ async def start_quiz_attempt(user_id: str, quiz_id: str, course_id: str) -> Dict
     quiz = getattr(quiz_resp, "data", None)
     if not quiz:
         raise ValueError(f"Quiz not found: {quiz_id}")
+
+    # Defensive backstop — the frontend polls course_quizzes.status and only
+    # calls start once it's 'completed', but this guards against stale links,
+    # a second tab, or a race, instead of silently creating a 0-question
+    # attempt (the previous behavior when question_order wasn't populated yet).
+    status = quiz.get("status")
+    if status == "generating":
+        raise ValueError("This quiz is still generating. Please wait a moment and try again.")
+    if status == "failed":
+        raise ValueError(quiz.get("error_message") or "Quiz generation failed. Please generate a new quiz.")
 
     course_resp = await run_db_operation(
         lambda: _supabase.table("courses")
