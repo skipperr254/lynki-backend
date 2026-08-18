@@ -116,6 +116,12 @@ class ExtractionService:
             except ValueError as e:
                 raise ValueError(f"Text extraction failed: {str(e)}")
 
+            # Postgres text columns reject the null byte outright (22P05) —
+            # some PDF generators emit \x00 routinely in extracted text even
+            # from otherwise-valid files, so strip it before it ever reaches
+            # a query rather than treating it as a corrupt-file signal.
+            extracted_text = extracted_text.replace("\x00", "")
+
             if not extracted_text or len(extracted_text.strip()) < 50:
                 raise ValueError(
                     "This document has too little text to work with. "
