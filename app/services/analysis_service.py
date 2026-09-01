@@ -2,7 +2,7 @@ import json
 import logging
 import re
 import asyncio
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from anthropic import AsyncAnthropic, APITimeoutError, APIConnectionError
 from anthropic.types import TextBlock
 from app.core.config import get_settings
@@ -14,6 +14,14 @@ settings = get_settings()
 # Timeout configuration
 CLAUDE_TIMEOUT_SECONDS = 60  # 60 seconds for Haiku analysis
 MAX_API_RETRIES = 2
+# Bounds concurrent Claude chunk-analysis calls per document. Sized to cover
+# a typical document in a single wave: at chunk_size=8000 a ~60k-char chapter
+# splits into ~10 chunks, and a bound of 5 made that two waves — measured at
+# 42.0s vs 28.6s for one wave, with identical extraction yield. This is a
+# per-document bound, so N documents processing at once put N times this many
+# calls in flight; if that starts drawing 429s, add a process-wide gate rather
+# than lowering this back down.
+CHUNK_ANALYSIS_MAX_CONCURRENCY = 10
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +47,48 @@ class AnalysisService:
             chunks = self._chunk_text(text, chunk_size=8000)
             logger.info(f"Split document {document_id} into {len(chunks)} chunks for analysis.")
 
-            for i, chunk in enumerate(chunks):
-                logger.info(f"Processing chunk {i+1}/{len(chunks)}...")
-                await self._process_chunk(document_id, chunk, i, len(chunks))
+            # Phase 1: run all chunk API calls concurrently (bounded, no shared
+            # state — each call just returns parsed data, nothing is saved yet).
+            semaphore = asyncio.Semaphore(CHUNK_ANALYSIS_MAX_CONCURRENCY)
+            tasks = [
+                asyncio.create_task(
+                    self._analyze_chunk(document_id, chunk, i, len(chunks), semaphore)
+                )
+                for i, chunk in enumerate(chunks)
+            ]
+
+            try:
+                results = await asyncio.gather(*tasks)
+            except Exception:
+                # An unexpected error in one chunk aborts the whole document,
+                # same as before. Cancel siblings so we don't leave orphaned
+                # Claude calls running in the background after we've already
+                # decided this run failed.
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
+            # Phase 2: merge every chunk's topics in memory (chunk order is
+            # preserved, so cross-chunk topic dedup resolves exactly as the
+            # old per-chunk read-then-write did), then save the whole
+            # document at once. Saving per chunk cost 2 sequential round
+            # trips per topic — ~54 on a 10-chunk document — which is pure
+            # network latency and the dominant cost of this method now that
+            # the API calls run in a single wave.
+            merged: Dict[str, List[Dict[str, Any]]] = {}
+            usages: List[Any] = []
+            for i, result in enumerate(results):
+                if result is None:
+                    continue  # chunk exhausted retries; nothing to save
+                data, usage = result
+                self._merge_structure(merged, data)
+                usages.append(usage)
+                logger.info(f"Chunk {i+1}/{len(chunks)} merged successfully")
+
+            await self._save_structure(document_id, merged)
+            await self._log_usage(document_id, "structure_extraction_chunk", usages)
 
         except Exception as e:
             logger.error(f"Analysis failed for {document_id}: {str(e)}")
@@ -121,142 +168,132 @@ class AnalysisService:
 
         return json_str
 
-    async def _process_chunk(self, document_id: str, text_chunk: str, chunk_index: int, total_chunks: int):
-        """Process a single chunk with retry logic."""
-        for attempt in range(MAX_API_RETRIES + 1):
-            try:
-                system_prompt = (
-                    "You are an expert educational curriculum designer. "
-                    "Analyze this course material section and extract key learning elements.\n\n"
-                    "Identify main Topics. For each Topic, list the key Concepts. "
-                    "For each Concept: provide a concise explanation (1-2 sentences) and extract a relevant quote as source_text.\n\n"
-                    "CRITICAL JSON RULES:\n"
-                    "- Output ONLY valid JSON\n"
-                    "- NO markdown code blocks\n"
-                    "- NO trailing commas\n"
-                    "- Keep explanations concise (under 100 words each)\n"
-                    "- Limit to 5-10 concepts per topic maximum\n\n"
-                    "Format: {{\"topics\": [{{\"name\": \"Topic\", \"concepts\": [{{\"name\": \"Concept\", \"explanation\": \"Brief explanation\", \"source_text\": \"Quote\"}}]}}]}}\n\n"
-                    "Example: {{\"topics\": [{{\"name\": \"Machine Learning\", \"concepts\": [{{\"name\": \"Neural Networks\", \"explanation\": \"Computational models inspired by brain structure\", \"source_text\": \"Neural networks consist of interconnected nodes...\"}}]}}]}}"
-                )
+    async def _analyze_chunk(
+        self,
+        document_id: str,
+        text_chunk: str,
+        chunk_index: int,
+        total_chunks: int,
+        semaphore: asyncio.Semaphore,
+    ) -> Optional[Tuple[Dict[str, Any], Any]]:
+        """
+        Call Claude + parse JSON for a single chunk, with retry logic.
+        API-call phase only — does NOT save to the database. Returns
+        (data, usage) on success, or None if retries were exhausted
+        (best-effort; caller skips saving for this chunk). A genuinely
+        unexpected error still raises, aborting the whole document.
+        """
+        async with semaphore:
+            for attempt in range(MAX_API_RETRIES + 1):
+                try:
+                    system_prompt = (
+                        "You are an expert educational curriculum designer. "
+                        "Analyze this course material section and extract key learning elements.\n\n"
+                        "Identify main Topics. For each Topic, list the key Concepts. "
+                        "For each Concept: provide a concise explanation (1-2 sentences) and extract a relevant quote as source_text.\n\n"
+                        "CRITICAL JSON RULES:\n"
+                        "- Output ONLY valid JSON\n"
+                        "- NO markdown code blocks\n"
+                        "- NO trailing commas\n"
+                        "- Keep explanations concise (under 100 words each)\n"
+                        "- Limit to 5-10 concepts per topic maximum\n\n"
+                        "Format: {{\"topics\": [{{\"name\": \"Topic\", \"concepts\": [{{\"name\": \"Concept\", \"explanation\": \"Brief explanation\", \"source_text\": \"Quote\"}}]}}]}}\n\n"
+                        "Example: {{\"topics\": [{{\"name\": \"Machine Learning\", \"concepts\": [{{\"name\": \"Neural Networks\", \"explanation\": \"Computational models inspired by brain structure\", \"source_text\": \"Neural networks consist of interconnected nodes...\"}}]}}]}}"
+                    )
 
-                user_message = f"Content (Chunk {chunk_index+1}/{total_chunks}):\n\n{text_chunk}"
+                    user_message = f"Content (Chunk {chunk_index+1}/{total_chunks}):\n\n{text_chunk}"
 
-                # Use asyncio.wait_for for timeout handling
-                response = await asyncio.wait_for(
-                    self.client.messages.create(
-                        model=self.model,
-                        max_tokens=4000,  # Haiku's safe limit
-                        system=system_prompt,
-                        messages=[
-                            {"role": "user", "content": user_message}
-                        ],
-                        temperature=0.1
-                    ),
-                    timeout=CLAUDE_TIMEOUT_SECONDS
-                )
+                    # Use asyncio.wait_for for timeout handling
+                    response = await asyncio.wait_for(
+                        self.client.messages.create(
+                            model=self.model,
+                            max_tokens=4000,  # Haiku's safe limit
+                            system=system_prompt,
+                            messages=[
+                                {"role": "user", "content": user_message}
+                            ],
+                            temperature=0.1
+                        ),
+                        timeout=CLAUDE_TIMEOUT_SECONDS
+                    )
 
-                # Type-safe extraction of text content
-                content_block = response.content[0]
-                if not isinstance(content_block, TextBlock):
-                    raise ValueError(f"Unexpected content type: {type(content_block).__name__}")
+                    # Type-safe extraction of text content
+                    content_block = response.content[0]
+                    if not isinstance(content_block, TextBlock):
+                        raise ValueError(f"Unexpected content type: {type(content_block).__name__}")
 
-                response_text = content_block.text
+                    response_text = content_block.text
 
-                # Check if response was truncated
-                if response.stop_reason == "max_tokens":
-                    logger.warning(f"Chunk {chunk_index+1} hit token limit. Response may be truncated.")
+                    # Check if response was truncated
+                    if response.stop_reason == "max_tokens":
+                        logger.warning(f"Chunk {chunk_index+1} hit token limit. Response may be truncated.")
 
-                # Clean and extract JSON
-                json_str = self._extract_and_clean_json(response_text)
-                data = json.loads(json_str)
+                    # Clean and extract JSON
+                    json_str = self._extract_and_clean_json(response_text)
+                    data = json.loads(json_str)
 
-                # Save to Database (ASYNC - uses run_db_operation)
-                await self._save_structure(document_id, data)
+                    logger.info(f"Chunk {chunk_index+1}/{total_chunks} processed successfully")
+                    return data, response.usage  # Success
 
-                # Log Usage (ASYNC)
-                await self._log_usage(document_id, "structure_extraction_chunk", response.usage)
+                except asyncio.TimeoutError:
+                    logger.error(f"Attempt {attempt+1}: Claude API timeout after {CLAUDE_TIMEOUT_SECONDS}s for chunk {chunk_index+1}")
+                    if attempt < MAX_API_RETRIES:
+                        logger.info(f"Retrying chunk {chunk_index+1} after timeout...")
+                        await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                    else:
+                        logger.error(f"Failed to process chunk {chunk_index+1} after {MAX_API_RETRIES+1} attempts due to timeouts")
+                        # Don't raise - continue with other chunks
 
-                logger.info(f"Chunk {chunk_index+1}/{total_chunks} processed successfully")
-                break  # Success
+                except (APITimeoutError, APIConnectionError) as e:
+                    logger.error(f"Attempt {attempt+1}: Claude API connection error for chunk {chunk_index+1}: {e}")
+                    if attempt < MAX_API_RETRIES:
+                        logger.info(f"Retrying chunk {chunk_index+1} after connection error...")
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        logger.error(f"Failed to process chunk {chunk_index+1} after {MAX_API_RETRIES+1} attempts")
 
-            except asyncio.TimeoutError:
-                logger.error(f"Attempt {attempt+1}: Claude API timeout after {CLAUDE_TIMEOUT_SECONDS}s for chunk {chunk_index+1}")
-                if attempt < MAX_API_RETRIES:
-                    logger.info(f"Retrying chunk {chunk_index+1} after timeout...")
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
-                else:
-                    logger.error(f"Failed to process chunk {chunk_index+1} after {MAX_API_RETRIES+1} attempts due to timeouts")
-                    # Don't raise - continue with other chunks
+                except json.JSONDecodeError as e:
+                    logger.error(f"Attempt {attempt+1}: Failed to parse JSON from Claude: {e}")
+                    if attempt < MAX_API_RETRIES:
+                        logger.info(f"Retrying chunk {chunk_index+1} due to JSON error...")
+                    else:
+                        logger.error(f"Failed to process chunk {chunk_index+1} after {MAX_API_RETRIES+1} attempts.")
 
-            except (APITimeoutError, APIConnectionError) as e:
-                logger.error(f"Attempt {attempt+1}: Claude API connection error for chunk {chunk_index+1}: {e}")
-                if attempt < MAX_API_RETRIES:
-                    logger.info(f"Retrying chunk {chunk_index+1} after connection error...")
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    logger.error(f"Failed to process chunk {chunk_index+1} after {MAX_API_RETRIES+1} attempts")
+                except Exception as e:
+                    logger.error(f"Unexpected error processing chunk {chunk_index+1}: {e}")
+                    raise e
 
-            except json.JSONDecodeError as e:
-                logger.error(f"Attempt {attempt+1}: Failed to parse JSON from Claude: {e}")
-                if attempt < MAX_API_RETRIES:
-                    logger.info(f"Retrying chunk {chunk_index+1} due to JSON error...")
-                else:
-                    logger.error(f"Failed to process chunk {chunk_index+1} after {MAX_API_RETRIES+1} attempts.")
+            return None  # retries exhausted (best-effort; caller skips saving)
 
-            except Exception as e:
-                logger.error(f"Unexpected error processing chunk {chunk_index+1}: {e}")
-                raise e
+    @staticmethod
+    def _merge_structure(
+        merged: Dict[str, List[Dict[str, Any]]],
+        data: Dict[str, Any],
+    ) -> None:
+        """Fold one chunk's parsed topics into the document-wide structure.
 
-    async def _save_structure(self, document_id: str, data: Dict[str, Any]):
-        """Save extracted topics and concepts to database (ASYNC)."""
-        topics = data.get("topics", [])
+        Topic name is the dedup key, exactly as the old per-chunk
+        SELECT-by-name was: a topic named by several chunks collects all of
+        their concepts under one entry. Pure and in-memory — chunk iteration
+        order is the only thing deciding the final ordering.
+        """
+        for topic_data in data.get("topics", []) or []:
+            if not isinstance(topic_data, dict):
+                continue
 
-        for topic_data in topics:
             topic_name = topic_data.get("name")
             if not topic_name:
                 logger.warning("Topic missing 'name' field, skipping")
                 continue
 
-            # 1. Check if topic already exists for this document (ASYNC)
-            existing_topic = await run_db_operation(
-                lambda tn=topic_name: self.supabase.table("topics")
-                    .select("id")
-                    .eq("document_id", document_id)
-                    .eq("name", tn)
-                    .execute()
-            )
+            # setdefault, not a guarded insert: a topic with no usable
+            # concepts still gets its row, as it did before.
+            bucket = merged.setdefault(topic_name, [])
 
-            topic_id = None
-            if existing_topic.data and isinstance(existing_topic.data, list) and len(existing_topic.data) > 0:
-                first_topic = existing_topic.data[0]
-                if isinstance(first_topic, dict) and "id" in first_topic:
-                    topic_id = first_topic["id"]
-
-            if not topic_id:
-                # Insert New Topic (ASYNC)
-                topic_res = await run_db_operation(
-                    lambda tn=topic_name: self.supabase.table("topics").insert({
-                        "document_id": document_id,
-                        "name": tn
-                    }).execute()
-                )
-
-                if topic_res.data and isinstance(topic_res.data, list) and len(topic_res.data) > 0:
-                    first_new_topic = topic_res.data[0]
-                    if isinstance(first_new_topic, dict) and "id" in first_new_topic:
-                        topic_id = first_new_topic["id"]
-
-                if not topic_id:
-                    logger.warning(f"Failed to insert topic: {topic_name}")
-                    continue
-
-            # Insert Concepts (ASYNC)
-            concepts = topic_data.get("concepts", [])
+            concepts = topic_data.get("concepts")
             if not concepts or not isinstance(concepts, list):
                 continue
 
-            concept_rows = []
             for concept in concepts:
                 if not isinstance(concept, dict):
                     continue
@@ -265,33 +302,124 @@ class AnalysisService:
                 if not concept_name:
                     continue
 
-                concept_rows.append({
-                    "topic_id": topic_id,
+                bucket.append({
                     "name": concept_name,
                     "explanation": concept.get("explanation", ""),
                     "source_text": concept.get("source_text", ""),
-                    "complexity_level": "intermediate"
+                    "complexity_level": "intermediate",
                 })
 
-            if concept_rows:
-                try:
-                    await run_db_operation(
-                        lambda rows=concept_rows: self.supabase.table("concepts").insert(rows).execute()
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to insert concepts for topic {topic_name}: {e}")
+    async def _save_structure(
+        self,
+        document_id: str,
+        merged: Dict[str, List[Dict[str, Any]]],
+    ) -> None:
+        """Save the merged topic/concept structure in a fixed 3 round trips.
 
-    async def _log_usage(self, document_id: str, operation: str, usage: Any):
-        """Log API usage to database (ASYNC)."""
+        (1) one SELECT of this document's existing topics, (2) one bulk
+        INSERT of the ones it doesn't have yet, (3) one bulk INSERT of every
+        concept across every topic. The count is fixed regardless of how many
+        topics the document has.
+
+        The existing-topic read still earns its trip: a document reprocessed
+        after a partial failure already has rows, and reusing them is what
+        keeps a retry from duplicating every topic.
+        """
+        if not merged:
+            return
+
+        topic_names = list(merged.keys())
+
+        # Every topic for the document, rather than an `in_` over the names —
+        # the count is small, it costs the same single trip, and it sidesteps
+        # quoting topic names that contain commas into a PostgREST filter.
+        existing_resp = await run_db_operation(
+            lambda: self.supabase.table("topics")
+            .select("id, name")
+            .eq("document_id", document_id)
+            .execute()
+        )
+        existing = getattr(existing_resp, "data", None) or []
+        topic_ids: Dict[str, str] = {
+            r["name"]: r["id"]
+            for r in existing
+            if isinstance(r, dict) and r.get("name") and r.get("id")
+        }
+
+        new_names = [n for n in topic_names if n not in topic_ids]
+        if new_names:
+            new_rows = [{"document_id": document_id, "name": n} for n in new_names]
+            insert_resp = await run_db_operation(
+                lambda: self.supabase.table("topics").insert(new_rows).execute()
+            )
+            # Map the returned representation by name rather than by
+            # position — PostgREST promises no ordering for it.
+            for r in (getattr(insert_resp, "data", None) or []):
+                if isinstance(r, dict) and r.get("name") and r.get("id"):
+                    topic_ids[r["name"]] = r["id"]
+
+        unsaved = [n for n in topic_names if n not in topic_ids]
+        if unsaved:
+            logger.warning(f"Failed to insert topic(s): {', '.join(unsaved)}")
+
+        concept_rows = [
+            {**concept, "topic_id": topic_ids[name]}
+            for name in topic_names
+            if name in topic_ids
+            for concept in merged[name]
+        ]
+        if not concept_rows:
+            return
+
         try:
             await run_db_operation(
-                lambda: self.supabase.table("llm_logs").insert({
-                    "document_id": document_id,
-                    "operation": operation,
-                    "model": self.model,
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens
-                }).execute()
+                lambda: self.supabase.table("concepts").insert(concept_rows).execute()
+            )
+        except Exception as e:
+            # A single unwritable row would otherwise cost the document every
+            # concept it extracted. Fall back to the pre-batching granularity
+            # so the blast radius stays one topic.
+            logger.error(f"Bulk concept insert failed, retrying per topic: {e}")
+            await self._save_concepts_per_topic(merged, topic_ids)
+
+    async def _save_concepts_per_topic(
+        self,
+        merged: Dict[str, List[Dict[str, Any]]],
+        topic_ids: Dict[str, str],
+    ) -> None:
+        """Fallback path for a rejected bulk concept insert: one INSERT per
+        topic, so one bad row loses that topic's concepts and not the rest."""
+        for name, concepts in merged.items():
+            topic_id = topic_ids.get(name)
+            if not topic_id or not concepts:
+                continue
+
+            rows = [{**c, "topic_id": topic_id} for c in concepts]
+            try:
+                await run_db_operation(
+                    lambda r=rows: self.supabase.table("concepts").insert(r).execute()
+                )
+            except Exception as e:
+                logger.error(f"Failed to insert concepts for topic {name}: {e}")
+
+    async def _log_usage(self, document_id: str, operation: str, usages: List[Any]):
+        """Log every chunk's API usage in one insert (ASYNC)."""
+        rows = [
+            {
+                "document_id": document_id,
+                "operation": operation,
+                "model": self.model,
+                "input_tokens": u.input_tokens,
+                "output_tokens": u.output_tokens,
+            }
+            for u in usages
+        ]
+        if not rows:
+            return
+
+        try:
+            await run_db_operation(
+                lambda: self.supabase.table("llm_logs").insert(rows).execute()
             )
         except Exception as e:
             # Don't fail the whole process if logging fails

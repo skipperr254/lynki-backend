@@ -24,7 +24,7 @@ _supabase = get_supabase()
 # ---------------------------------------------------------------------------
 
 async def _fetch_quiz_questions_ordered(quiz_id: str) -> List[Dict[str, Any]]:
-    """Fetch questions for a quiz in the original shuffled order."""
+    """Fetch questions for a quiz in question_order (generation arrival order)."""
     quiz_resp = await run_db_operation(
         lambda: _supabase.table("course_quizzes")
         .select("question_order")
@@ -102,7 +102,7 @@ async def start_quiz_attempt(user_id: str, quiz_id: str, course_id: str) -> Dict
     """
     quiz_resp = await run_db_operation(
         lambda: _supabase.table("course_quizzes")
-        .select("id, name, status, error_message")
+        .select("id, name, status, error_message, question_order")
         .eq("id", quiz_id)
         .maybe_single()
         .execute()
@@ -111,12 +111,13 @@ async def start_quiz_attempt(user_id: str, quiz_id: str, course_id: str) -> Dict
     if not quiz:
         raise ValueError(f"Quiz not found: {quiz_id}")
 
-    # Defensive backstop — the frontend polls course_quizzes.status and only
-    # calls start once it's 'completed', but this guards against stale links,
-    # a second tab, or a race, instead of silently creating a 0-question
-    # attempt (the previous behavior when question_order wasn't populated yet).
+    # The frontend waits for a terminal status before starting an attempt,
+    # but a quiz still 'generating' is accepted here as long as it has at
+    # least one question — a stale link or a second tab can reach this first.
+    # The empty-order rejection below is the backstop against 0-question
+    # attempts.
     status = quiz.get("status")
-    if status == "generating":
+    if status == "generating" and not (quiz.get("question_order") or []):
         raise ValueError("This quiz is still generating. Please wait a moment and try again.")
     if status == "failed":
         raise ValueError(quiz.get("error_message") or "Quiz generation failed. Please generate a new quiz.")

@@ -21,6 +21,10 @@ DOCUMENT_PROCESSING_TIMEOUT = 600
 SCANNED_PAGE_CHAR_THRESHOLD = 50
 # Claude Vision model for OCR on images and scanned PDF pages
 VISION_MODEL = "claude-sonnet-4-6"
+# Bounds concurrent Claude Vision OCR calls per PDF (shared Anthropic account
+# across this whole backend; quiz generation runs its own higher bound in
+# on_demand_quiz_service.py since that flow is interactive).
+PDF_OCR_MAX_CONCURRENCY = 5
 
 
 class ExtractionService:
@@ -246,38 +250,61 @@ class ExtractionService:
         Extract text from a PDF using PyMuPDF.
         Pages with fewer than SCANNED_PAGE_CHAR_THRESHOLD characters of native text
         are treated as scanned and processed with Claude Vision OCR.
+
+        Two phases:
+        1. Sequential walk of pages via fitz (fast, CPU-bound) — collects native
+           text directly and queues (page_num, png_bytes) for pages needing OCR.
+           The PDF document is closed at the end of this phase; nothing after
+           this point touches fitz objects, so there's no concern about using
+           them from concurrent tasks.
+        2. Concurrent OCR phase — all queued pages are OCR'd in parallel,
+           bounded by a semaphore. Results are written back by page index so
+           the final text is reassembled in original page order regardless of
+           completion order.
         """
         loop = asyncio.get_event_loop()
         pdf_doc = await loop.run_in_executor(
             None, lambda: fitz.open(stream=file_content, filetype="pdf")
         )
+        pages_text: list[str | None] = [None] * len(pdf_doc)
+        ocr_jobs: list[tuple[int, bytes]] = []
         try:
-            pages_text = []
             for page_num in range(len(pdf_doc)):
                 page = pdf_doc[page_num]
                 native_text = await loop.run_in_executor(None, page.get_text)
 
                 if len(native_text.strip()) >= SCANNED_PAGE_CHAR_THRESHOLD:
-                    pages_text.append(native_text.strip())
+                    pages_text[page_num] = native_text.strip()
                 else:
                     logger.info(
                         f"Page {page_num + 1}: native text too short "
-                        f"({len(native_text.strip())} chars), using Vision OCR"
+                        f"({len(native_text.strip())} chars), queuing for Vision OCR"
                     )
                     matrix = fitz.Matrix(2, 2)
                     pixmap = await loop.run_in_executor(
                         None, lambda p=page, m=matrix: p.get_pixmap(matrix=m)
                     )
                     png_bytes = await loop.run_in_executor(None, pixmap.tobytes, "png")
-                    ocr_text = await self._ocr_image_bytes(png_bytes, "image/png")
-                    if ocr_text:
-                        pages_text.append(ocr_text)
-                    else:
-                        logger.warning(f"Page {page_num + 1}: Vision OCR returned empty text")
-
-            return "\n\n".join(pages_text).strip()
+                    ocr_jobs.append((page_num, png_bytes))
         finally:
             pdf_doc.close()
+
+        if ocr_jobs:
+            semaphore = asyncio.Semaphore(PDF_OCR_MAX_CONCURRENCY)
+
+            async def _ocr_job(page_num: int, png_bytes: bytes) -> tuple[int, str]:
+                async with semaphore:
+                    text = await self._ocr_image_bytes(png_bytes, "image/png")
+                    if not text:
+                        logger.warning(f"Page {page_num + 1}: Vision OCR returned empty text")
+                    return page_num, text
+
+            results = await asyncio.gather(*(_ocr_job(pn, b) for pn, b in ocr_jobs))
+            for page_num, text in results:
+                if text:
+                    pages_text[page_num] = text
+
+        return "\n\n".join(t for t in pages_text if t).strip()
 
     async def _ocr_image_bytes(self, image_bytes: bytes, media_type: str) -> str:
         """

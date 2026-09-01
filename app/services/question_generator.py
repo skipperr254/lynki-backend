@@ -246,7 +246,11 @@ class QuestionGenerator:
                         "text": {"type": "string", "description": option_text_desc},
                         "explanation": {
                             "type": "string",
-                            "description": "Why this option is correct or incorrect in this specific case (>= 10 characters).",
+                            "description": (
+                                "ONE sentence, max 25 words: why this option is "
+                                "correct or incorrect in this specific case "
+                                "(>= 10 characters)."
+                            ),
                         },
                     },
                     "required": ["text", "explanation"],
@@ -340,7 +344,8 @@ CRITICAL QUALITY REQUIREMENTS:
 
 RULES:
 - NO "All of the above" or "None of the above"
-- NO "Both A and B" compound options"""
+- NO "Both A and B" compound options
+- Option explanations: ONE sentence each, max 25 words"""
 
     def _build_user_message(
         self,

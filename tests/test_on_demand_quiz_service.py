@@ -166,6 +166,117 @@ async def test_job_never_exceeds_its_time_budget_and_keeps_partial_results(fake_
 
 
 @pytest.mark.asyncio
+async def test_question_order_is_published_once_in_the_terminal_write(
+    fake_supabase, monkeypatch
+):
+    """course_quizzes is written exactly once by the job — the terminal update.
+
+    The job used to flush question_order after every completed batch so the
+    frontend could start the quiz before generation finished. Measured, the
+    3rd of 10 concurrent questions landed ~2s before the last and the poll
+    interval consumed all of it, so the partial writes are gone. A regression
+    would show up here as an extra update carrying no status.
+    """
+    delays = {"concept-0": 0.01, "concept-1": 0.03, "concept-2": 0.05}
+
+    async def fake_generate(concept, quiz_id, semaphore, excluded_questions=None):
+        await asyncio.sleep(delays[concept["id"]])
+        return f"question-{concept['id']}"
+
+    monkeypatch.setattr(svc, "_generate_and_save_question", fake_generate)
+
+    await svc.run_quiz_generation_job(
+        quiz_id="quiz-1", user_id="u1", course_id="c1", concepts=_concepts(3), quiz_size=3
+    )
+
+    updates = [c[2] for c in fake_supabase.calls if c[0] == "course_quizzes" and c[1] == "update"]
+    assert len(updates) == 1
+    assert updates[0]["status"] == "completed"
+    assert len(updates[0]["question_order"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_question_order_follows_selection_not_completion(fake_supabase, monkeypatch):
+    """No shuffle, and no dependence on which task happens to finish first.
+
+    Order comes from the concept-selection order (the job iterates its task
+    list, not the `done` set, precisely so this is deterministic), even when
+    the concepts complete in reverse.
+    """
+    delays = {"concept-0": 0.05, "concept-1": 0.03, "concept-2": 0.01}
+
+    async def fake_generate(concept, quiz_id, semaphore, excluded_questions=None):
+        await asyncio.sleep(delays[concept["id"]])
+        return f"question-{concept['id']}"
+
+    monkeypatch.setattr(svc, "_generate_and_save_question", fake_generate)
+    # Selection is weighted-random; pin it so the expected order is fixed.
+    monkeypatch.setattr(
+        svc, "_select_concepts", lambda concepts, mastery_map, quiz_size: concepts[:quiz_size]
+    )
+
+    await svc.run_quiz_generation_job(
+        quiz_id="quiz-1", user_id="u1", course_id="c1", concepts=_concepts(3), quiz_size=3
+    )
+
+    update = fake_supabase.last_update("course_quizzes")
+    assert update["question_order"] == [
+        "question-concept-0", "question-concept-1", "question-concept-2"
+    ]
+
+
+class FailOnceOnCompletedSupabase(FakeSupabase):
+    """Raises on the first course_quizzes update carrying status='completed'
+    (the job's terminal write), then behaves normally — so the outer except
+    handler's finalize write succeeds."""
+
+    def __init__(self):
+        super().__init__()
+        self.failed_once = False
+
+    def table(self, name):
+        outer = self
+
+        class _Table(FakeTable):
+            def execute(self):
+                if (
+                    not outer.failed_once
+                    and self._op == "update"
+                    and isinstance(self._payload, dict)
+                    and self._payload.get("status") == "completed"
+                ):
+                    outer.failed_once = True
+                    raise RuntimeError("terminal write failed")
+                return super().execute()
+
+        return _Table(self.calls, name)
+
+
+@pytest.mark.asyncio
+async def test_crash_after_partial_questions_finalizes_completed(monkeypatch):
+    """Invariant: 'failed' ⇔ zero questions. A job that crashes after saving
+    questions must finalize the quiz as completed with what exists."""
+    fake = FailOnceOnCompletedSupabase()
+    monkeypatch.setattr(svc, "_supabase", fake)
+
+    async def fake_generate(concept, quiz_id, semaphore, excluded_questions=None):
+        return f"question-{concept['id']}"
+
+    monkeypatch.setattr(svc, "_generate_and_save_question", fake_generate)
+
+    await svc.run_quiz_generation_job(
+        quiz_id="quiz-1", user_id="u1", course_id="c1", concepts=_concepts(3), quiz_size=3
+    )
+
+    update = fake.last_update("course_quizzes")
+    assert update["status"] == "completed"
+    assert update["total_questions"] == 3
+    assert set(update["question_order"]) == {
+        "question-concept-0", "question-concept-1", "question-concept-2"
+    }
+
+
+@pytest.mark.asyncio
 async def test_start_quiz_generation_returns_immediately_without_generating(fake_supabase, monkeypatch):
     monkeypatch.setattr(svc, "_get_concepts_for_course", AsyncMock(return_value=_concepts(2)))
     generate_mock = AsyncMock()

@@ -29,7 +29,9 @@ _supabase = get_supabase()
 _question_generator = QuestionGenerator()
 _settings = get_settings()
 
-MAX_CONCURRENT_GENERATIONS = 5
+# Sized to the default quiz so all questions generate in a single wave —
+# two waves of 5 was the dominant cost of the ~35s users waited.
+MAX_CONCURRENT_GENERATIONS = 10
 DEFAULT_QUIZ_SIZE = 10
 
 # Wall-clock budget for the whole question-generation job. This is an
@@ -171,8 +173,11 @@ async def _generate_quiz_name(concept_names: List[str]) -> str:
             "Examples: 'The Chemistry of Cellular Energy', 'Market Forces in Practice', "
             "'Into the Nervous System'. Return only the title, nothing else."
         )
+        # Haiku: a 40-token title doesn't need Sonnet, and this call runs
+        # concurrently with question generation so it must never be the
+        # long pole.
         response = await client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-haiku-4-5",
             max_tokens=40,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -340,11 +345,24 @@ async def run_quiz_generation_job(
     are kept (partial success beats none) and course_quizzes.status is always
     left in a terminal state ('completed' or 'failed') — never stuck on
     'generating' past this function returning.
+
+    question_order and total_questions are written once, in the terminal
+    update — the frontend waits for a terminal status rather than reading a
+    partially-filled row. Invariant: 'failed' ⇔ zero questions; any path that
+    dies with partial questions finalizes as 'completed' with what exists.
     """
+    name_task: Optional[asyncio.Task] = None
+    question_ids: List[str] = []
+    pending: set = set()
     try:
         mastery_map = await _get_mastery_map(user_id, course_id)
         selected_concepts = _select_concepts(concepts, mastery_map, quiz_size)
         prior_stems = await _get_prior_question_stems(user_id, course_id)
+
+        # Naming needs only the selected concept names, so it runs
+        # concurrently with question generation instead of serially after it.
+        concept_names = [c["name"] for c in selected_concepts]
+        name_task = asyncio.create_task(_generate_quiz_name(concept_names))
 
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
         tasks = [
@@ -354,18 +372,18 @@ async def run_quiz_generation_job(
             for c in selected_concepts
         ]
 
+        # All the questions generate in one wave, so a single bounded wait is
+        # the whole schedule. (This previously flushed question_order after
+        # each completed batch so the frontend could start early; the 3rd of
+        # 10 concurrent questions landed ~2s before the last, and the poll
+        # interval consumed all of it.)
         done, pending = await asyncio.wait(tasks, timeout=QUIZ_GENERATION_TIMEOUT)
-        if pending:
-            logger.warning(
-                f"Quiz {quiz_id}: {len(pending)}/{len(tasks)} question generation "
-                f"task(s) still running past the {QUIZ_GENERATION_TIMEOUT}s budget — "
-                f"cancelling, keeping {len(done)} completed."
-            )
-            for t in pending:
-                t.cancel()
 
-        question_ids: List[str] = []
-        for t in done:
+        # Iterate `tasks`, not the `done` set: keeps question order
+        # deterministic and matching concept-selection order.
+        for t in tasks:
+            if t not in done:
+                continue
             try:
                 qid = t.result()
             except Exception as e:
@@ -374,8 +392,18 @@ async def run_quiz_generation_job(
             if qid is not None:
                 question_ids.append(qid)
 
+        if pending:
+            logger.warning(
+                f"Quiz {quiz_id}: {len(pending)}/{len(tasks)} question generation "
+                f"task(s) still running past the {QUIZ_GENERATION_TIMEOUT}s budget — "
+                f"cancelling, keeping {len(question_ids)} completed."
+            )
+            for t in pending:
+                t.cancel()
+
         if not question_ids:
             logger.error(f"Quiz {quiz_id}: generation produced no questions")
+            name_task.cancel()
             await run_db_operation(
                 lambda: _supabase.table("course_quizzes").update({
                     "status": "failed",
@@ -385,10 +413,17 @@ async def run_quiz_generation_job(
             )
             return
 
-        random.shuffle(question_ids)
+        # No shuffle: concept selection is already weighted-random, so task
+        # order carries no bias.
 
-        concept_names = [c["name"] for c in selected_concepts]
-        quiz_name = await _generate_quiz_name(concept_names)
+        # Usually already resolved by now (questions take far longer than the
+        # name). The wait_for guard keeps a hung naming call from stalling the
+        # whole job; _generate_quiz_name itself already falls back to "Quiz"
+        # on API errors.
+        try:
+            quiz_name = await asyncio.wait_for(name_task, timeout=30)
+        except Exception:
+            quiz_name = "Quiz"
 
         await run_db_operation(
             lambda: _supabase.table("course_quizzes").update({
@@ -403,13 +438,40 @@ async def run_quiz_generation_job(
 
     except Exception as e:
         logger.error(f"Quiz {quiz_id}: generation job failed: {e}")
+        for t in pending:
+            t.cancel()
+        if name_task is not None and not name_task.done():
+            name_task.cancel()
         try:
-            await run_db_operation(
-                lambda: _supabase.table("course_quizzes").update({
-                    "status": "failed",
-                    "error_message": "Quiz generation failed unexpectedly. Please try again.",
-                    "updated_at": _now_iso(),
-                }).eq("id", quiz_id).execute()
-            )
+            if question_ids:
+                # Invariant: 'failed' ⇔ zero questions. A crash after partial
+                # questions were saved finalizes as completed with what exists.
+                quiz_name = "Quiz"
+                if name_task is not None and name_task.done() and not name_task.cancelled():
+                    try:
+                        quiz_name = name_task.result()
+                    except Exception:
+                        pass
+                await run_db_operation(
+                    lambda: _supabase.table("course_quizzes").update({
+                        "name": quiz_name,
+                        "total_questions": len(question_ids),
+                        "question_order": question_ids,
+                        "status": "completed",
+                        "updated_at": _now_iso(),
+                    }).eq("id", quiz_id).execute()
+                )
+                logger.warning(
+                    f"Quiz {quiz_id}: finalized as completed with "
+                    f"{len(question_ids)} question(s) after job failure"
+                )
+            else:
+                await run_db_operation(
+                    lambda: _supabase.table("course_quizzes").update({
+                        "status": "failed",
+                        "error_message": "Quiz generation failed unexpectedly. Please try again.",
+                        "updated_at": _now_iso(),
+                    }).eq("id", quiz_id).execute()
+                )
         except Exception:
             pass
