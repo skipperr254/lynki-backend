@@ -2,6 +2,7 @@ import asyncio
 import io
 import logging
 import base64
+from datetime import datetime, timezone
 import fitz  # PyMuPDF
 import docx
 from pptx import Presentation
@@ -95,7 +96,7 @@ class ExtractionService:
                 return
 
             # 2. Update status to processing (ASYNC)
-            await self._update_status(document_id, "processing")
+            await self._start_processing(document_id)
             logger.info(f"Document {document_id}: Status updated to 'processing'")
 
             # 3. Download file (ASYNC)
@@ -142,6 +143,7 @@ class ExtractionService:
 
             # 5. Extract Structure (Topics & Concepts)
             logger.info(f"Document {document_id}: Starting AI analysis...")
+            await self._update_processing_stage(document_id, "analyzing")
             try:
                 await self.analysis_service.analyze_document(document_id, extracted_text)
             except ValueError:
@@ -218,6 +220,27 @@ class ExtractionService:
         """Update document status (ASYNC)."""
         await run_db_operation(
             lambda: self.supabase.table("documents").update({"status": status}).eq("id", document_id).execute()
+        )
+
+    async def _start_processing(self, document_id: str):
+        """
+        Mark a document as entering processing, stamping processing_started_at
+        fresh for this attempt so the frontend can show real elapsed time
+        instead of a fake progress animation. One update call so the row
+        never briefly shows 'processing' without a stage/start time.
+        """
+        await run_db_operation(
+            lambda: self.supabase.table("documents").update({
+                "status": "processing",
+                "processing_stage": "extracting",
+                "processing_started_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", document_id).execute()
+        )
+
+    async def _update_processing_stage(self, document_id: str, stage: str):
+        """Update the processing_stage sub-status (ASYNC)."""
+        await run_db_operation(
+            lambda: self.supabase.table("documents").update({"processing_stage": stage}).eq("id", document_id).execute()
         )
 
     async def _extract_text_async(self, file_content: bytes, file_type: str) -> str:
