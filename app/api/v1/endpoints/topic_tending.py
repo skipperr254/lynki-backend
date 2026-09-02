@@ -309,6 +309,12 @@ async def complete_session(req: CompleteRequest):
         if req.results.active_recall.evaluation:
             update_payload["active_recall_evaluation"] = req.results.active_recall.evaluation
 
+    # Persist mnemonic results
+    if req.results.mnemonics:
+        update_payload["mnemonic_results"] = [
+            {"id": m.id, "locked_in": m.lockedIn} for m in req.results.mnemonics
+        ]
+
     # Persist concept pair results
     if req.results.connections:
         correct = sum(1 for c in req.results.connections if c.matched)
@@ -317,6 +323,13 @@ async def complete_session(req: CompleteRequest):
             "correct": correct,
             "incorrect": incorrect,
         }
+
+    # Persist quiz results summary (mirrors persistQuizStage's per-stage write
+    # so a resumed session's own /complete call still sees the quiz already
+    # ran, even if the earlier fire-and-forget write from the stage itself
+    # somehow didn't land before this request).
+    if req.results.quiz:
+        update_payload["quiz_results"] = req.results.quiz.model_dump()
 
     await run_db_operation(
         lambda: _supabase.table("topic_tending_sessions")

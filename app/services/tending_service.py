@@ -2,6 +2,7 @@ import json
 import logging
 import uuid
 import asyncio
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from anthropic import AsyncAnthropic, APITimeoutError, APIConnectionError
 from app.core.config import get_settings
@@ -110,11 +111,26 @@ class TendingService:
             )
             content = response.content[0].text
             generated_data = _parse_json_response(content)
+            # Fold the title into generated_content so a later resume (which
+            # hydrates straight from this row) doesn't need a topics join.
+            generated_data["topic_title"] = topic_title
         except Exception as e:
             logger.error(f"Claude tending generation failed: {e}")
             raise
 
         # 4. Save Session to DB
+        # Invariant: at most one incomplete (not completed, not abandoned) row
+        # per user+topic. Enforced here rather than relied upon client-side —
+        # if anything upstream ever races and calls generate twice for the
+        # same topic (a duplicate frontend re-render, two tabs, a retry),
+        # this stops it from leaving orphaned rows that a later "resume"
+        # lookup could pick up instead of the session actually in use.
+        db.table("topic_tending_sessions").update({
+            "abandoned_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("user_id", user_id).eq("topic_id", topic_id).is_(
+            "completed_at", "null"
+        ).is_("abandoned_at", "null").execute()
+
         session_id = str(uuid.uuid4())
         session_row = {
             "id": session_id,
