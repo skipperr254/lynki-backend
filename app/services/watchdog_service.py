@@ -3,7 +3,7 @@ Watchdog: periodically marks documents stuck in pending/processing as failed,
 and finalizes course_quizzes rows stuck in 'generating'.
 
 Documents: straight-to-failed (not re-enqueue). The Claude API already
-retries 3x per chunk during active processing, so transient failures are
+retries 3x per document during active processing, so transient failures are
 covered. If the Render worker dies mid-task the built-in asyncio.wait_for /
 asyncio.wait timeout never fires — this watchdog catches that case.
 

@@ -1,313 +1,260 @@
-import json
 import logging
-import re
 import asyncio
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Tuple
 from anthropic import AsyncAnthropic, APITimeoutError, APIConnectionError
-from anthropic.types import TextBlock
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from app.core.config import get_settings
 from app.core.supabase import get_supabase
 from app.core.async_db import run_db_operation
 
 settings = get_settings()
 
-# Timeout configuration
-CLAUDE_TIMEOUT_SECONDS = 60  # 60 seconds for Haiku analysis
+# One analysis call now covers a whole document rather than an ~8000-char
+# chunk, so it emits far more output tokens and runs serially instead of as a
+# parallel wave -- minutes, not the ~30s a chunk wave took. 300s covers that
+# with room to spare and still sits well inside extraction_service's 600s
+# DOCUMENT_PROCESSING_TIMEOUT, which has to fit OCR in the same budget.
+ANALYSIS_TIMEOUT_SECONDS = 300
 MAX_API_RETRIES = 2
-# Bounds concurrent Claude chunk-analysis calls per document. Sized to cover
-# a typical document in a single wave: at chunk_size=8000 a ~60k-char chapter
-# splits into ~10 chunks, and a bound of 5 made that two waves — measured at
-# 42.0s vs 28.6s for one wave, with identical extraction yield. This is a
-# per-document bound, so N documents processing at once put N times this many
-# calls in flight; if that starts drawing 429s, add a process-wide gate rather
-# than lowering this back down.
-CHUNK_ANALYSIS_MAX_CONCURRENCY = 10
+
+# Refuse oversized documents rather than truncate or re-introduce splitting.
+# The model's context window is ~4M characters, so this cap leaves a wide
+# margin for the output budget and prompt overhead while still sitting far
+# above any realistic upload (a dense 300-page chapter is well under 1M).
+MAX_ANALYSIS_CHARS = 1_500_000
+
+# Bounds the response so a pathological document cannot ask for an unbounded
+# one. The model allows up to 128k output tokens; 16k is on the order of 200
+# concepts, more than any single document should legitimately yield.
+MAX_OUTPUT_TOKENS = 16000
 
 logger = logging.getLogger(__name__)
+
+
+class ConceptOut(BaseModel):
+    """One extracted concept.
+
+    `extra="forbid"` is what puts `additionalProperties: false` into the
+    generated JSON schema, which structured outputs requires.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="The concept as a student would refer to it.")
+    explanation: str = Field(
+        description="1-2 sentences on what this concept actually says."
+    )
+    source_text: str = Field(
+        description="A short verbatim quote from the material that grounds this concept."
+    )
+
+
+class TopicOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="The topic heading.")
+    concepts: List[ConceptOut] = Field(
+        description="The key concepts taught under this topic."
+    )
+
+
+class DocumentStructure(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    topics: List[TopicOut] = Field(
+        description="Topics in the order they appear in the material."
+    )
 
 
 class AnalysisService:
     def __init__(self):
         self.supabase = get_supabase()
         self.client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-        self.model = "claude-sonnet-4-6"  # Using Sonnet
+        self.model = "claude-sonnet-5"
 
     async def analyze_document(self, document_id: str, text: str):
         """
-        Analyzes the extracted text to identify topics and concepts using Claude.
-        Uses chunking to handle large documents and output token limits.
-        All database operations are async to prevent blocking.
+        Analyze a document's full extracted text in a single Claude call and
+        save the resulting topics/concepts.
+
+        The text is sent whole rather than in ~8000-char chunks. Chunking
+        existed only to stay inside a context limit that the current model's
+        1M-token window makes irrelevant, and it was actively splitting single
+        concepts across two calls -- producing two half-grounded concept rows
+        for one idea, each of which then became its own BKT knowledge
+        component. All database operations are async to avoid blocking the
+        event loop.
         """
         if not text or len(text) < 50:
             logger.warning(f"Text too short for analysis: Document {document_id}")
             return
 
+        if len(text) > MAX_ANALYSIS_CHARS:
+            # User-facing: extraction_service re-raises ValueError unchanged.
+            raise ValueError(
+                "This document is too large for us to analyse in one pass. "
+                "Try uploading it a chapter at a time."
+            )
+
         try:
-            # Chunk the text (smaller chunks = less output = fits in token limit)
-            chunks = self._chunk_text(text, chunk_size=8000)
-            logger.info(f"Split document {document_id} into {len(chunks)} chunks for analysis.")
+            logger.info(
+                f"Analyzing document {document_id} as a whole "
+                f"({len(text)} characters)"
+            )
+            structure, usage = await self._extract_structure(text)
 
-            # Phase 1: run all chunk API calls concurrently (bounded, no shared
-            # state — each call just returns parsed data, nothing is saved yet).
-            semaphore = asyncio.Semaphore(CHUNK_ANALYSIS_MAX_CONCURRENCY)
-            tasks = [
-                asyncio.create_task(
-                    self._analyze_chunk(document_id, chunk, i, len(chunks), semaphore)
-                )
-                for i, chunk in enumerate(chunks)
-            ]
-
-            try:
-                results = await asyncio.gather(*tasks)
-            except Exception:
-                # An unexpected error in one chunk aborts the whole document,
-                # same as before. Cancel siblings so we don't leave orphaned
-                # Claude calls running in the background after we've already
-                # decided this run failed.
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
-
-            # Phase 2: merge every chunk's topics in memory (chunk order is
-            # preserved, so cross-chunk topic dedup resolves exactly as the
-            # old per-chunk read-then-write did), then save the whole
-            # document at once. Saving per chunk cost 2 sequential round
-            # trips per topic — ~54 on a 10-chunk document — which is pure
-            # network latency and the dominant cost of this method now that
-            # the API calls run in a single wave.
-            merged: Dict[str, List[Dict[str, Any]]] = {}
-            usages: List[Any] = []
-            for i, result in enumerate(results):
-                if result is None:
-                    continue  # chunk exhausted retries; nothing to save
-                data, usage = result
-                self._merge_structure(merged, data)
-                usages.append(usage)
-                logger.info(f"Chunk {i+1}/{len(chunks)} merged successfully")
-
+            merged = self._to_save_shape(structure)
             await self._save_structure(document_id, merged)
-            await self._log_usage(document_id, "structure_extraction_chunk", usages)
+            await self._log_usage(document_id, "structure_extraction", [usage])
 
         except Exception as e:
             logger.error(f"Analysis failed for {document_id}: {str(e)}")
             raise e
 
-    def _chunk_text(self, text: str, chunk_size: int = 8000) -> List[str]:
+    async def _extract_structure(self, text: str) -> Tuple[DocumentStructure, Any]:
+        """Call Claude once for the whole document and return the validated
+        structure plus its usage.
+
+        Uses structured outputs (`messages.parse` with a Pydantic
+        `output_format`) rather than free-text JSON. The schema is enforced
+        server-side, so the markdown-fence-stripping and trailing-comma-
+        rewriting repair path this replaced has nothing left to repair --
+        which matters far more now that one malformed response would cost the
+        whole document instead of one chunk of it.
+
+        Retries cover transport failures only. A `ValueError` raised in here
+        is terminal and user-facing, so it deliberately escapes the loop.
         """
-        Split text into chunks that respect paragraph boundaries.
-        This prevents cutting content mid-sentence and preserves context.
-        """
-        if len(text) <= chunk_size:
-            return [text]
+        system_prompt = self._build_system_prompt(text)
+        last_error: Exception | None = None
 
-        chunks = []
-        current_chunk = ""
+        for attempt in range(MAX_API_RETRIES + 1):
+            try:
+                response = await asyncio.wait_for(
+                    self.client.messages.parse(
+                        model=self.model,
+                        max_tokens=MAX_OUTPUT_TOKENS,
+                        system=system_prompt,
+                        messages=[{"role": "user", "content": text}],
+                        output_format=DocumentStructure,
+                    ),
+                    timeout=ANALYSIS_TIMEOUT_SECONDS,
+                )
 
-        # Split by double newlines (paragraphs) first, then single newlines
-        paragraphs = text.split("\n\n")
-
-        for paragraph in paragraphs:
-            paragraph = paragraph.strip()
-            if not paragraph:
-                continue
-
-            # If adding this paragraph exceeds the limit
-            if len(current_chunk) + len(paragraph) + 2 > chunk_size:
-                # Save current chunk if it has content
-                if current_chunk.strip():
-                    chunks.append(current_chunk.strip())
-
-                # If a single paragraph is too long, split by sentences
-                if len(paragraph) > chunk_size:
-                    sentences = self._split_into_sentences(paragraph)
-                    current_chunk = ""
-                    for sentence in sentences:
-                        if len(current_chunk) + len(sentence) + 1 > chunk_size:
-                            if current_chunk.strip():
-                                chunks.append(current_chunk.strip())
-                            current_chunk = sentence
-                        else:
-                            current_chunk += (" " if current_chunk else "") + sentence
-                else:
-                    current_chunk = paragraph
-            else:
-                current_chunk += ("\n\n" if current_chunk else "") + paragraph
-
-        # Don't forget the last chunk
-        if current_chunk.strip():
-            chunks.append(current_chunk.strip())
-
-        return chunks if chunks else [text]
-
-    def _split_into_sentences(self, text: str) -> List[str]:
-        """Split text into sentences for finer granularity."""
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        return [s.strip() for s in sentences if s.strip()]
-
-    def _extract_and_clean_json(self, text: str) -> str:
-        """Extract JSON from response and clean common formatting issues."""
-        # Remove markdown code blocks if present
-        text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
-        text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE)
-
-        # Find JSON object boundaries
-        start_idx = text.find('{')
-        end_idx = text.rfind('}') + 1
-
-        if start_idx == -1 or end_idx == 0:
-            raise ValueError("No JSON object found in response")
-
-        json_str = text[start_idx:end_idx]
-
-        # Fix common JSON issues
-        # Remove trailing commas before closing braces/brackets
-        json_str = re.sub(r',\s*}', '}', json_str)
-        json_str = re.sub(r',\s*]', ']', json_str)
-
-        return json_str
-
-    async def _analyze_chunk(
-        self,
-        document_id: str,
-        text_chunk: str,
-        chunk_index: int,
-        total_chunks: int,
-        semaphore: asyncio.Semaphore,
-    ) -> Optional[Tuple[Dict[str, Any], Any]]:
-        """
-        Call Claude + parse JSON for a single chunk, with retry logic.
-        API-call phase only — does NOT save to the database. Returns
-        (data, usage) on success, or None if retries were exhausted
-        (best-effort; caller skips saving for this chunk). A genuinely
-        unexpected error still raises, aborting the whole document.
-        """
-        async with semaphore:
-            for attempt in range(MAX_API_RETRIES + 1):
-                try:
-                    system_prompt = (
-                        "You are an expert educational curriculum designer. "
-                        "Analyze this course material section and extract key learning elements.\n\n"
-                        "Identify main Topics. For each Topic, list the key Concepts. "
-                        "For each Concept: provide a concise explanation (1-2 sentences) and extract a relevant quote as source_text.\n\n"
-                        "CRITICAL JSON RULES:\n"
-                        "- Output ONLY valid JSON\n"
-                        "- NO markdown code blocks\n"
-                        "- NO trailing commas\n"
-                        "- Keep explanations concise (under 100 words each)\n"
-                        "- Limit to 5-10 concepts per topic maximum\n\n"
-                        "Format: {{\"topics\": [{{\"name\": \"Topic\", \"concepts\": [{{\"name\": \"Concept\", \"explanation\": \"Brief explanation\", \"source_text\": \"Quote\"}}]}}]}}\n\n"
-                        "Example: {{\"topics\": [{{\"name\": \"Machine Learning\", \"concepts\": [{{\"name\": \"Neural Networks\", \"explanation\": \"Computational models inspired by brain structure\", \"source_text\": \"Neural networks consist of interconnected nodes...\"}}]}}]}}"
+                if response.stop_reason == "max_tokens":
+                    # Truncated output used to be logged as a warning and then
+                    # parsed anyway, silently dropping everything past the cut.
+                    # With one call per document that would quietly cost the
+                    # back half of the material, so fail loudly instead.
+                    raise ValueError(
+                        "This document produced more material than we can analyse "
+                        "in one pass. Try uploading it a chapter at a time."
                     )
 
-                    user_message = f"Content (Chunk {chunk_index+1}/{total_chunks}):\n\n{text_chunk}"
-
-                    # Use asyncio.wait_for for timeout handling
-                    response = await asyncio.wait_for(
-                        self.client.messages.create(
-                            model=self.model,
-                            max_tokens=4000,  # Haiku's safe limit
-                            system=system_prompt,
-                            messages=[
-                                {"role": "user", "content": user_message}
-                            ],
-                            temperature=0.1
-                        ),
-                        timeout=CLAUDE_TIMEOUT_SECONDS
+                structure = response.parsed_output
+                if structure is None:
+                    raise ValueError(
+                        "We had trouble reading this document's content. "
+                        "Please try again."
                     )
 
-                    # Type-safe extraction of text content
-                    content_block = response.content[0]
-                    if not isinstance(content_block, TextBlock):
-                        raise ValueError(f"Unexpected content type: {type(content_block).__name__}")
+                logger.info(
+                    f"Extracted {len(structure.topics)} topic(s), "
+                    f"{sum(len(t.concepts) for t in structure.topics)} concept(s)"
+                )
+                return structure, response.usage
 
-                    response_text = content_block.text
+            except (
+                asyncio.TimeoutError,
+                APITimeoutError,
+                APIConnectionError,
+                ValidationError,
+            ) as e:
+                last_error = e
+                logger.error(
+                    f"Attempt {attempt + 1}/{MAX_API_RETRIES + 1} of document "
+                    f"analysis failed: {type(e).__name__}: {e}"
+                )
+                if attempt < MAX_API_RETRIES:
+                    await asyncio.sleep(2 ** attempt)  # 1s, then 2s
 
-                    # Check if response was truncated
-                    if response.stop_reason == "max_tokens":
-                        logger.warning(f"Chunk {chunk_index+1} hit token limit. Response may be truncated.")
-
-                    # Clean and extract JSON
-                    json_str = self._extract_and_clean_json(response_text)
-                    data = json.loads(json_str)
-
-                    logger.info(f"Chunk {chunk_index+1}/{total_chunks} processed successfully")
-                    return data, response.usage  # Success
-
-                except asyncio.TimeoutError:
-                    logger.error(f"Attempt {attempt+1}: Claude API timeout after {CLAUDE_TIMEOUT_SECONDS}s for chunk {chunk_index+1}")
-                    if attempt < MAX_API_RETRIES:
-                        logger.info(f"Retrying chunk {chunk_index+1} after timeout...")
-                        await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
-                    else:
-                        logger.error(f"Failed to process chunk {chunk_index+1} after {MAX_API_RETRIES+1} attempts due to timeouts")
-                        # Don't raise - continue with other chunks
-
-                except (APITimeoutError, APIConnectionError) as e:
-                    logger.error(f"Attempt {attempt+1}: Claude API connection error for chunk {chunk_index+1}: {e}")
-                    if attempt < MAX_API_RETRIES:
-                        logger.info(f"Retrying chunk {chunk_index+1} after connection error...")
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        logger.error(f"Failed to process chunk {chunk_index+1} after {MAX_API_RETRIES+1} attempts")
-
-                except json.JSONDecodeError as e:
-                    logger.error(f"Attempt {attempt+1}: Failed to parse JSON from Claude: {e}")
-                    if attempt < MAX_API_RETRIES:
-                        logger.info(f"Retrying chunk {chunk_index+1} due to JSON error...")
-                    else:
-                        logger.error(f"Failed to process chunk {chunk_index+1} after {MAX_API_RETRIES+1} attempts.")
-
-                except Exception as e:
-                    logger.error(f"Unexpected error processing chunk {chunk_index+1}: {e}")
-                    raise e
-
-            return None  # retries exhausted (best-effort; caller skips saving)
+        raise RuntimeError(
+            f"Document analysis failed after {MAX_API_RETRIES + 1} attempts"
+        ) from last_error
 
     @staticmethod
-    def _merge_structure(
-        merged: Dict[str, List[Dict[str, Any]]],
-        data: Dict[str, Any],
-    ) -> None:
-        """Fold one chunk's parsed topics into the document-wide structure.
+    def _build_system_prompt(text: str) -> str:
+        """System prompt for whole-document analysis.
 
-        Topic name is the dedup key, exactly as the old per-chunk
-        SELECT-by-name was: a topic named by several chunks collects all of
-        their concepts under one entry. Pure and in-memory — chunk iteration
-        order is the only thing deciding the final ordering.
+        Carries no JSON formatting rules at all: the response schema is
+        enforced by structured outputs, so the prompt only has to describe the
+        work. What it does have to do is push for coverage. Chunking used to
+        guarantee that structurally -- every section got its own API call, so
+        the model could not skip page 47 -- and a single call over the whole
+        document will otherwise drift toward summarising the opening.
         """
-        for topic_data in data.get("topics", []) or []:
-            if not isinstance(topic_data, dict):
-                continue
+        # Roughly one concept per 1200 characters, clamped. Gives a
+        # length-aware target instead of the flat "5-10 concepts per topic"
+        # that asked the same of a 60k-char chapter and a 6k-char handout.
+        target = max(8, min(120, len(text) // 1200))
 
-            topic_name = topic_data.get("name")
+        return (
+            "You are an expert educational curriculum designer. You are given the "
+            "COMPLETE text of one piece of course material. Extract the learning "
+            "structure a student needs in order to master it.\n\n"
+            "Identify the main Topics, and under each Topic the key Concepts. "
+            "For each Concept give its name as a student would refer to it, a "
+            "1-2 sentence explanation of what it actually says, and a short "
+            "verbatim quote from the material that grounds it.\n\n"
+            "COVERAGE REQUIREMENTS -- these matter more than brevity:\n"
+            "- Work through the material from its beginning all the way to its "
+            "end. The closing sections must be represented as thoroughly as the "
+            "opening ones.\n"
+            "- Emit topics in the order they appear in the material.\n"
+            "- Do not summarise and do not stop early. This is an extraction "
+            "task, not a synopsis.\n"
+            f"- Aim for roughly {target} concepts in total across all topics, "
+            "scaled to how much genuinely distinct material is present.\n"
+            "- Every concept must be distinct. Never emit the same idea twice "
+            "under two different names."
+        )
+
+    @staticmethod
+    def _to_save_shape(
+        structure: DocumentStructure,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Fold the model's response into the {topic_name: [concept_row]} shape
+        `_save_structure` consumes.
+
+        Topic name remains the dedup key, exactly as it was when chunk results
+        were merged: a name the model emits twice collects both entries'
+        concepts under a single topic row.
+        """
+        merged: Dict[str, List[Dict[str, Any]]] = {}
+
+        for topic in structure.topics:
+            topic_name = topic.name.strip()
             if not topic_name:
-                logger.warning("Topic missing 'name' field, skipping")
+                logger.warning("Topic with empty name, skipping")
                 continue
 
-            # setdefault, not a guarded insert: a topic with no usable
-            # concepts still gets its row, as it did before.
+            # setdefault, not a guarded insert: a topic with no usable concepts
+            # still gets its row, as it did before.
             bucket = merged.setdefault(topic_name, [])
 
-            concepts = topic_data.get("concepts")
-            if not concepts or not isinstance(concepts, list):
-                continue
-
-            for concept in concepts:
-                if not isinstance(concept, dict):
-                    continue
-
-                concept_name = concept.get("name")
+            for concept in topic.concepts:
+                concept_name = concept.name.strip()
                 if not concept_name:
                     continue
 
                 bucket.append({
                     "name": concept_name,
-                    "explanation": concept.get("explanation", ""),
-                    "source_text": concept.get("source_text", ""),
+                    "explanation": concept.explanation,
+                    "source_text": concept.source_text,
                     "complexity_level": "intermediate",
                 })
+
+        return merged
 
     async def _save_structure(
         self,
@@ -330,7 +277,7 @@ class AnalysisService:
 
         topic_names = list(merged.keys())
 
-        # Every topic for the document, rather than an `in_` over the names —
+        # Every topic for the document, rather than an `in_` over the names --
         # the count is small, it costs the same single trip, and it sidesteps
         # quoting topic names that contain commas into a PostgREST filter.
         existing_resp = await run_db_operation(
@@ -353,7 +300,7 @@ class AnalysisService:
                 lambda: self.supabase.table("topics").insert(new_rows).execute()
             )
             # Map the returned representation by name rather than by
-            # position — PostgREST promises no ordering for it.
+            # position -- PostgREST promises no ordering for it.
             for r in (getattr(insert_resp, "data", None) or []):
                 if isinstance(r, dict) and r.get("name") and r.get("id"):
                     topic_ids[r["name"]] = r["id"]
@@ -403,7 +350,7 @@ class AnalysisService:
                 logger.error(f"Failed to insert concepts for topic {name}: {e}")
 
     async def _log_usage(self, document_id: str, operation: str, usages: List[Any]):
-        """Log every chunk's API usage in one insert (ASYNC)."""
+        """Log the analysis call's API usage in one insert (ASYNC)."""
         rows = [
             {
                 "document_id": document_id,

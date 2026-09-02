@@ -144,6 +144,12 @@ class ExtractionService:
             logger.info(f"Document {document_id}: Starting AI analysis...")
             try:
                 await self.analysis_service.analyze_document(document_id, extracted_text)
+            except ValueError:
+                # analyze_document raises ValueError only with prose already
+                # written for the student (e.g. the document-too-large
+                # message), so let it through rather than replacing it with
+                # the generic text below.
+                raise
             except Exception as e:
                 logger.error(f"Document {document_id}: Analysis failed - {str(e)}")
                 raise ValueError(

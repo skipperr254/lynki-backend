@@ -1,12 +1,14 @@
 """
-Tests for analysis_service's concurrent chunk analysis and batched save: the
-cross-chunk topic dedup, exception-abort semantics, best-effort handling of
-individual chunk retry exhaustion, reuse of a reprocessed document's existing
+Tests for analysis_service's single-call whole-document analysis and batched
+save: that the complete text goes out in exactly one API call, that terminal
+failures (oversized input, truncated output) raise without writing a partial
+structure, that transport failures retry, and — unchanged from when this
+service chunked — the topic dedup, reuse of a reprocessed document's existing
 topics, the per-topic fallback when a bulk concept insert is rejected, and the
 round-trip count the batching exists to hold down.
 
-`_analyze_chunk` (the Claude call) is monkeypatched so these tests exercise
-only the orchestration logic in `analyze_document` — no live API calls.
+`client.messages.parse` is faked so these tests exercise only the
+orchestration logic in `analyze_document` — no live API calls.
 `AnalysisService.__init__` is bypassed (it constructs a real AsyncAnthropic
 client) via `__new__`, matching this repo's existing pattern of avoiding that
 ~1s construction cost in tests that don't need it (see
@@ -16,12 +18,52 @@ import asyncio
 
 import pytest
 
-from app.services.analysis_service import AnalysisService
+from app.services.analysis_service import (
+    AnalysisService,
+    ConceptOut,
+    DocumentStructure,
+    MAX_ANALYSIS_CHARS,
+    MAX_API_RETRIES,
+    TopicOut,
+)
 
 
 class FakeUsage:
     input_tokens = 10
     output_tokens = 10
+
+
+class FakeParsedResponse:
+    """Stands in for the object `messages.parse` returns."""
+
+    def __init__(self, structure, stop_reason: str = "end_turn"):
+        self.parsed_output = structure
+        self.stop_reason = stop_reason
+        self.usage = FakeUsage()
+
+
+class FakeMessages:
+    """Records every parse() call so tests can assert how many were made and
+    what text each one actually received. Queued entries that are exceptions
+    are raised instead of returned, which is how the retry paths are driven."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls: list[dict] = []
+
+    async def parse(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self._responses:
+            raise AssertionError("parse() called more times than responses queued")
+        nxt = self._responses.pop(0)
+        if isinstance(nxt, BaseException):
+            raise nxt
+        return nxt
+
+
+class FakeClient:
+    def __init__(self, responses):
+        self.messages = FakeMessages(responses)
 
 
 class FakeTopicsTable:
@@ -155,18 +197,14 @@ class FakeSupabase:
         return sum(1 for t, o, _ in self.calls if t == table and o == op)
 
 
-def _make_service(fake_supabase, monkeypatch) -> AnalysisService:
+def _make_service(fake_supabase, monkeypatch, responses=()) -> AnalysisService:
     svc = AnalysisService.__new__(AnalysisService)
     svc.supabase = fake_supabase
-    svc.client = None
-    svc.model = "claude-sonnet-4-6"
+    svc.client = FakeClient(responses)
+    svc.model = "claude-sonnet-5"
 
     async def _run(fn):
-        # A real yield point (unlike a bare `return fn()`) — matters for
-        # test_cross_chunk_topic_saved_once_with_all_concepts: it's what
-        # would let two *concurrently scheduled* saves interleave their
-        # SELECT/INSERT and race, if a future regression moved saving back
-        # inside the concurrent per-chunk tasks. Mirrors the real
+        # A real yield point (unlike a bare `return fn()`) mirrors the real
         # run_db_operation, which awaits a thread-pool executor.
         await asyncio.sleep(0)
         return fn()
@@ -175,203 +213,269 @@ def _make_service(fake_supabase, monkeypatch) -> AnalysisService:
     return svc
 
 
-def _chunk_data(topic_name: str, concept_name: str) -> dict:
-    return {
-        "topics": [
-            {
-                "name": topic_name,
-                "concepts": [
-                    {"name": concept_name, "explanation": "e", "source_text": "s"}
+@pytest.fixture
+def no_backoff(monkeypatch):
+    """Collapse the retry backoff (1s, then 2s) so retry tests stay fast.
+    `real_sleep` is captured before patching, so there's no recursion."""
+    real_sleep = asyncio.sleep
+
+    async def _fast(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast)
+
+
+def _structure(*topics) -> DocumentStructure:
+    """Build a DocumentStructure from (topic_name, [concept_name, ...]) pairs."""
+    return DocumentStructure(
+        topics=[
+            TopicOut(
+                name=name,
+                concepts=[
+                    ConceptOut(name=c, explanation="e", source_text="s")
+                    for c in concept_names
                 ],
-            }
+            )
+            for name, concept_names in topics
         ]
-    }
-
-
-def _fixed_chunks(*chunks):
-    return lambda text, chunk_size=8000: list(chunks)
+    )
 
 
 @pytest.mark.asyncio
-async def test_cross_chunk_topic_saved_once_with_all_concepts(monkeypatch):
-    """Two chunks both name a topic 'Cell Biology'. Exactly one topic row
-    should be written, with both chunks' concepts under it, even when the
-    chunks resolve out of (chunk) order."""
+async def test_whole_text_goes_out_in_exactly_one_call(monkeypatch):
+    """The point of the change: no chunking. One call, carrying the complete
+    text rather than a ~8000-char slice of it."""
     fake_supabase = FakeSupabase()
-    svc = _make_service(fake_supabase, monkeypatch)
+    text = "word " * 10_000  # 50k chars — would have been ~7 chunks before
+    svc = _make_service(
+        fake_supabase,
+        monkeypatch,
+        [FakeParsedResponse(_structure(("Cell Biology", ["Mitosis"])))],
+    )
 
-    async def fake_analyze_chunk(document_id, text_chunk, chunk_index, total_chunks, semaphore):
-        # Force out-of-order completion: chunk 0 finishes after chunk 1.
-        if chunk_index == 0:
-            await asyncio.sleep(0.02)
-        return _chunk_data("Cell Biology", f"Concept {chunk_index}"), FakeUsage()
+    await svc.analyze_document("doc-1", text)
 
-    monkeypatch.setattr(svc, "_analyze_chunk", fake_analyze_chunk)
-    monkeypatch.setattr(svc, "_chunk_text", _fixed_chunks("chunk a", "chunk b"))
+    calls = svc.client.messages.calls
+    assert len(calls) == 1, "document must be analysed in a single call"
+    assert calls[0]["messages"][0]["content"] == text, "full text must be sent intact"
+    assert calls[0]["output_format"] is DocumentStructure
+
+
+@pytest.mark.asyncio
+async def test_topics_and_concepts_are_saved(monkeypatch):
+    fake_supabase = FakeSupabase()
+    svc = _make_service(
+        fake_supabase,
+        monkeypatch,
+        [
+            FakeParsedResponse(
+                _structure(
+                    ("Cell Biology", ["Mitosis", "Meiosis"]),
+                    ("Genetics", ["Alleles"]),
+                )
+            )
+        ],
+    )
 
     await svc.analyze_document("doc-1", "x" * 60)
 
-    topic_rows = fake_supabase.rows("topics")
-    assert len(topic_rows) == 1
-    assert topic_rows[0]["name"] == "Cell Biology"
+    topics = fake_supabase.rows("topics")
+    assert {t["name"] for t in topics} == {"Cell Biology", "Genetics"}
 
-    concept_rows = fake_supabase.rows("concepts")
-    assert len(concept_rows) == 2  # both concepts still saved
-    assert {r["name"] for r in concept_rows} == {"Concept 0", "Concept 1"}
-    # ...both under the single shared topic, not two separate ones
-    assert len({r["topic_id"] for r in concept_rows}) == 1
+    concepts = fake_supabase.rows("concepts")
+    assert {c["name"] for c in concepts} == {"Mitosis", "Meiosis", "Alleles"}
+    assert all(c["complexity_level"] == "intermediate" for c in concepts)
 
 
 @pytest.mark.asyncio
-async def test_unexpected_exception_aborts_whole_document_nothing_saved(monkeypatch):
-    """Saves are deferred until after the whole concurrent API-call phase
-    succeeds, so an unexpected error in any chunk means nothing from this
-    run is saved — not just chunks after the failing one."""
+async def test_repeated_topic_name_collapses_to_one_row(monkeypatch):
+    """The model naming the same topic twice must still yield one topic row,
+    carrying both entries' concepts."""
     fake_supabase = FakeSupabase()
-    svc = _make_service(fake_supabase, monkeypatch)
+    svc = _make_service(
+        fake_supabase,
+        monkeypatch,
+        [
+            FakeParsedResponse(
+                _structure(
+                    ("Cell Biology", ["Mitosis"]),
+                    ("Cell Biology", ["Meiosis"]),
+                )
+            )
+        ],
+    )
 
-    async def fake_analyze_chunk(document_id, text_chunk, chunk_index, total_chunks, semaphore):
-        if chunk_index == 1:
-            raise RuntimeError("boom")
-        await asyncio.sleep(0.05)  # chunk 0 would "finish" after chunk 1 raises
-        return _chunk_data("Topic A", "Concept A"), FakeUsage()
+    await svc.analyze_document("doc-1", "x" * 60)
 
-    monkeypatch.setattr(svc, "_analyze_chunk", fake_analyze_chunk)
-    monkeypatch.setattr(svc, "_chunk_text", _fixed_chunks("chunk a", "chunk b"))
+    topics = fake_supabase.rows("topics")
+    assert len(topics) == 1 and topics[0]["name"] == "Cell Biology"
 
-    with pytest.raises(RuntimeError, match="boom"):
-        await svc.analyze_document("doc-1", "x" * 60)
+    concepts = fake_supabase.rows("concepts")
+    assert {c["name"] for c in concepts} == {"Mitosis", "Meiosis"}
+    assert len({c["topic_id"] for c in concepts}) == 1
 
+
+@pytest.mark.asyncio
+async def test_text_too_short_returns_without_calling_the_api(monkeypatch):
+    fake_supabase = FakeSupabase()
+    svc = _make_service(fake_supabase, monkeypatch, [])
+
+    await svc.analyze_document("doc-1", "too short")
+
+    assert svc.client.messages.calls == []
     assert fake_supabase.calls == []
 
 
 @pytest.mark.asyncio
-async def test_chunk_retry_exhaustion_does_not_block_other_chunks(monkeypatch):
-    """A chunk that exhausts retries returns None (not an exception) — the
-    other chunks should still save normally, and only the surviving chunk's
-    token usage should be logged."""
+async def test_oversized_text_raises_before_any_api_call(monkeypatch):
+    """Oversized documents fail with user-facing prose rather than being
+    truncated or silently re-split."""
     fake_supabase = FakeSupabase()
-    svc = _make_service(fake_supabase, monkeypatch)
+    svc = _make_service(fake_supabase, monkeypatch, [])
 
-    async def fake_analyze_chunk(document_id, text_chunk, chunk_index, total_chunks, semaphore):
-        if chunk_index == 0:
-            return None  # retries exhausted, best-effort skip
-        return _chunk_data("Topic B", "Concept B"), FakeUsage()
+    with pytest.raises(ValueError, match="too large"):
+        await svc.analyze_document("doc-1", "x" * (MAX_ANALYSIS_CHARS + 1))
 
-    monkeypatch.setattr(svc, "_analyze_chunk", fake_analyze_chunk)
-    monkeypatch.setattr(svc, "_chunk_text", _fixed_chunks("chunk a", "chunk b"))
-
-    await svc.analyze_document("doc-1", "x" * 60)
-
-    topic_rows = fake_supabase.rows("topics")
-    assert len(topic_rows) == 1
-    assert topic_rows[0]["name"] == "Topic B"
-    assert len(fake_supabase.rows("concepts")) == 1
-    assert len(fake_supabase.rows("llm_logs")) == 1
+    assert svc.client.messages.calls == [], "must not spend a call on oversized input"
+    assert fake_supabase.calls == []
 
 
 @pytest.mark.asyncio
-async def test_all_chunks_failing_touches_the_database_not_at_all(monkeypatch):
-    """Nothing extracted means nothing to write — no empty inserts."""
+async def test_truncated_response_raises_and_saves_nothing(monkeypatch):
+    """A max_tokens stop used to be logged and the partial output parsed
+    anyway. With one call per document that would silently drop the back half
+    of the material, so it must raise instead."""
     fake_supabase = FakeSupabase()
-    svc = _make_service(fake_supabase, monkeypatch)
+    svc = _make_service(
+        fake_supabase,
+        monkeypatch,
+        [
+            FakeParsedResponse(
+                _structure(("Cell Biology", ["Mitosis"])), stop_reason="max_tokens"
+            )
+        ],
+    )
 
-    async def fake_analyze_chunk(document_id, text_chunk, chunk_index, total_chunks, semaphore):
-        return None
+    with pytest.raises(ValueError, match="one pass"):
+        await svc.analyze_document("doc-1", "x" * 60)
 
-    monkeypatch.setattr(svc, "_analyze_chunk", fake_analyze_chunk)
-    monkeypatch.setattr(svc, "_chunk_text", _fixed_chunks("chunk a", "chunk b"))
+    assert fake_supabase.calls == [], "no partial structure may be written"
+
+
+@pytest.mark.asyncio
+async def test_timeout_then_success_saves_normally(monkeypatch, no_backoff):
+    fake_supabase = FakeSupabase()
+    svc = _make_service(
+        fake_supabase,
+        monkeypatch,
+        [
+            asyncio.TimeoutError(),
+            FakeParsedResponse(_structure(("Cell Biology", ["Mitosis"]))),
+        ],
+    )
 
     await svc.analyze_document("doc-1", "x" * 60)
 
+    assert len(svc.client.messages.calls) == 2
+    assert [c["name"] for c in fake_supabase.rows("concepts")] == ["Mitosis"]
+
+
+@pytest.mark.asyncio
+async def test_retry_exhaustion_raises_and_touches_nothing(monkeypatch, no_backoff):
+    fake_supabase = FakeSupabase()
+    svc = _make_service(
+        fake_supabase,
+        monkeypatch,
+        [asyncio.TimeoutError() for _ in range(MAX_API_RETRIES + 1)],
+    )
+
+    with pytest.raises(RuntimeError, match="after 3 attempts"):
+        await svc.analyze_document("doc-1", "x" * 60)
+
+    assert len(svc.client.messages.calls) == MAX_API_RETRIES + 1
     assert fake_supabase.calls == []
 
 
 @pytest.mark.asyncio
 async def test_reprocessed_document_reuses_existing_topic_rows(monkeypatch):
-    """A document reprocessed after a partial failure already has topic rows.
-    They should be reused, not duplicated — this is what the surviving SELECT
-    round trip is for."""
+    """A document reprocessed after a partial failure already has topic rows;
+    reusing them is what stops a retry duplicating every topic."""
     fake_supabase = FakeSupabase()
-    fake_supabase.seed_topic("doc-1", "Topic A", "topic-existing")
-    svc = _make_service(fake_supabase, monkeypatch)
-
-    async def fake_analyze_chunk(document_id, text_chunk, chunk_index, total_chunks, semaphore):
-        return _chunk_data("Topic A", "Concept A"), FakeUsage()
-
-    monkeypatch.setattr(svc, "_analyze_chunk", fake_analyze_chunk)
-    monkeypatch.setattr(svc, "_chunk_text", _fixed_chunks("chunk a"))
+    fake_supabase.seed_topic("doc-1", "Cell Biology", "existing-topic-id")
+    svc = _make_service(
+        fake_supabase,
+        monkeypatch,
+        [FakeParsedResponse(_structure(("Cell Biology", ["Mitosis"])))],
+    )
 
     await svc.analyze_document("doc-1", "x" * 60)
 
-    assert fake_supabase.count("topics", "insert") == 0  # nothing new to insert
-    concept_rows = fake_supabase.rows("concepts")
-    assert len(concept_rows) == 1
-    assert concept_rows[0]["topic_id"] == "topic-existing"
+    assert fake_supabase.count("topics", "insert") == 0, "must reuse, not re-insert"
+    concepts = fake_supabase.rows("concepts")
+    assert [c["topic_id"] for c in concepts] == ["existing-topic-id"]
 
 
 @pytest.mark.asyncio
 async def test_bulk_concept_insert_failure_falls_back_to_per_topic(monkeypatch):
-    """One unwritable row must not cost the document every concept it
-    extracted: the bulk insert is retried per topic so the blast radius stays
-    a single topic, as it was before batching."""
+    """One unwritable row must cost its own topic's concepts, not the
+    document's."""
     fake_supabase = FakeSupabase()
     fake_supabase.fail_next["concepts"] = True
-    svc = _make_service(fake_supabase, monkeypatch)
-
-    async def fake_analyze_chunk(document_id, text_chunk, chunk_index, total_chunks, semaphore):
-        return {
-            "topics": [
-                {"name": "Topic A", "concepts": [{"name": "C1", "explanation": "e", "source_text": "s"}]},
-                {"name": "Topic B", "concepts": [{"name": "C2", "explanation": "e", "source_text": "s"}]},
-            ]
-        }, FakeUsage()
-
-    monkeypatch.setattr(svc, "_analyze_chunk", fake_analyze_chunk)
-    monkeypatch.setattr(svc, "_chunk_text", _fixed_chunks("chunk a"))
+    svc = _make_service(
+        fake_supabase,
+        monkeypatch,
+        [
+            FakeParsedResponse(
+                _structure(
+                    ("Cell Biology", ["Mitosis"]),
+                    ("Genetics", ["Alleles"]),
+                )
+            )
+        ],
+    )
 
     await svc.analyze_document("doc-1", "x" * 60)
 
-    assert fake_supabase.count("concepts", "insert_failed") == 1  # the bulk attempt
-    assert fake_supabase.count("concepts", "insert") == 2  # one per topic
-    saved = fake_supabase.rows("concepts")
-    assert {r["name"] for r in saved} == {"C1", "C2"}
+    assert fake_supabase.count("concepts", "insert_failed") == 1
+    # One INSERT per topic after the bulk attempt was rejected.
+    assert fake_supabase.count("concepts", "insert") == 2
+    assert {c["name"] for c in fake_supabase.rows("concepts")} == {"Mitosis", "Alleles"}
 
 
 @pytest.mark.asyncio
 async def test_save_round_trips_do_not_grow_with_topic_count(monkeypatch):
-    """The point of the batching: saving is a fixed number of round trips no
-    matter how many topics and chunks the document produced. Per-topic saving
-    cost 2 sequential trips each, which dominated processing time."""
+    """The batching exists to hold the save at a fixed 3 round trips (one
+    topic SELECT, one topic INSERT, one concept INSERT) no matter how many
+    topics the document produced."""
     fake_supabase = FakeSupabase()
-    svc = _make_service(fake_supabase, monkeypatch)
-
-    async def fake_analyze_chunk(document_id, text_chunk, chunk_index, total_chunks, semaphore):
-        return {
-            "topics": [
-                {
-                    "name": f"Topic {chunk_index}-{t}",
-                    "concepts": [
-                        {"name": f"C{chunk_index}-{t}-{c}", "explanation": "e", "source_text": "s"}
-                        for c in range(4)
-                    ],
-                }
-                for t in range(3)
-            ]
-        }, FakeUsage()
-
-    monkeypatch.setattr(svc, "_analyze_chunk", fake_analyze_chunk)
-    monkeypatch.setattr(svc, "_chunk_text", _fixed_chunks(*[f"chunk {i}" for i in range(4)]))
+    svc = _make_service(
+        fake_supabase,
+        monkeypatch,
+        [FakeParsedResponse(_structure(*[(f"Topic {i}", [f"C{i}"]) for i in range(12)]))],
+    )
 
     await svc.analyze_document("doc-1", "x" * 60)
 
-    # 12 topics, 48 concepts, 4 chunks — still one trip each.
     assert fake_supabase.count("topics", "select") == 1
     assert fake_supabase.count("topics", "insert") == 1
     assert fake_supabase.count("concepts", "insert") == 1
-    assert fake_supabase.count("llm_logs", "insert") == 1
-    assert len(fake_supabase.calls) == 4
-
     assert len(fake_supabase.rows("topics")) == 12
-    assert len(fake_supabase.rows("concepts")) == 48
-    assert len(fake_supabase.rows("llm_logs")) == 4  # one row per chunk, one insert
+
+
+@pytest.mark.asyncio
+async def test_one_llm_logs_row_per_document(monkeypatch):
+    """Was one row per chunk; a single call means a single row."""
+    fake_supabase = FakeSupabase()
+    svc = _make_service(
+        fake_supabase,
+        monkeypatch,
+        [FakeParsedResponse(_structure(("Cell Biology", ["Mitosis"])))],
+    )
+
+    await svc.analyze_document("doc-1", "x" * 60)
+
+    assert fake_supabase.count("llm_logs", "insert") == 1
+    rows = fake_supabase.rows("llm_logs")
+    assert len(rows) == 1
+    assert rows[0]["operation"] == "structure_extraction"
+    assert rows[0]["model"] == "claude-sonnet-5"
