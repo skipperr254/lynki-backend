@@ -97,9 +97,28 @@ def _format_questions(
 
 async def start_quiz_attempt(user_id: str, quiz_id: str, course_id: str) -> Dict[str, Any]:
     """
-    Start a new attempt on a quiz. Creates a quiz_attempts row.
+    Start an attempt on a quiz, creating a quiz_attempts row — unless the user
+    already has one in progress on this quiz, in which case that attempt is
+    resumed instead. Idempotent by design: the frontend's fresh-quiz URL
+    (`?quiz=X`, no `&attempt=`) doesn't gain an `&attempt=` param until this
+    call resolves, so a page reload before then re-runs this same call — it
+    must not mint a second attempt every time that happens.
     Returns TestData-shaped payload (test_id = attempt_id).
     """
+    existing_resp = await run_db_operation(
+        lambda: _supabase.table("quiz_attempts")
+        .select("id")
+        .eq("quiz_id", quiz_id)
+        .eq("user_id", user_id)
+        .eq("status", "in_progress")
+        .order("started_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    existing = getattr(existing_resp, "data", None) or []
+    if existing:
+        return await resume_quiz_attempt(user_id, existing[0]["id"])
+
     quiz_resp = await run_db_operation(
         lambda: _supabase.table("course_quizzes")
         .select("id, name, status, error_message, question_order")

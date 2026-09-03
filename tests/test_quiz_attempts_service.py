@@ -33,12 +33,19 @@ def stub_db(monkeypatch):
 
 
 async def _run_start_attempt_with_quiz(monkeypatch, quiz_row):
+    call_count = 0
+
     async def fake_run(fn):
+        nonlocal call_count
+        call_count += 1
+
         class _Resp:
-            data = quiz_row
+            # 1st call: existing-in-progress-attempt check (none found).
+            # 2nd call: the course_quizzes lookup (the gate under test).
+            data = [] if call_count == 1 else quiz_row
+
         return _Resp()
 
-    # First call in start_quiz_attempt is the course_quizzes lookup.
     monkeypatch.setattr(svc, "run_db_operation", fake_run)
     return await svc.start_quiz_attempt(user_id="u1", quiz_id="quiz-1", course_id="c1")
 
@@ -87,6 +94,8 @@ async def test_generating_quiz_with_partial_questions_starts(monkeypatch):
     returns whatever questions exist so far."""
     partial_order = ["q1", "q2", "q3"]
     _sequenced_db(monkeypatch, [
+        # 0. existing in-progress attempt check (none found)
+        [],
         # 1. course_quizzes lookup (the gate)
         _course_quizzes_response("generating", question_order=partial_order),
         # 2. courses title lookup
