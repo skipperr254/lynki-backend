@@ -10,7 +10,13 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     PROJECT_NAME: str = "Lynki Backend"
 
+    ALLOWED_ORIGINS: str = "https://app.passai.study,https://passai.study"
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
+
+    @property
+    def allowed_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
 
 @lru_cache()
 def get_settings():

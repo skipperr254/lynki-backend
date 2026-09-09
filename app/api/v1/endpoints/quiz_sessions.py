@@ -13,8 +13,9 @@ POST /quiz-sessions/generate
 """
 
 from typing import Optional
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
+from app.core.auth import get_current_user_id
 from app.services.on_demand_quiz_service import (
     start_quiz_generation,
     run_quiz_generation_job,
@@ -33,7 +34,13 @@ class GenerateQuizRequest(BaseModel):
 
 
 @router.post("/generate")
-async def generate_quiz_endpoint(req: GenerateQuizRequest, background_tasks: BackgroundTasks):
+async def generate_quiz_endpoint(
+    req: GenerateQuizRequest,
+    background_tasks: BackgroundTasks,
+    caller: str = Depends(get_current_user_id),
+):
+    if req.user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         result = await start_quiz_generation(
             user_id=req.user_id,
