@@ -3,8 +3,9 @@ import contextlib
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.core.auth import get_current_user_id
 from app.core.config import get_settings
 from app.api.v1.router import api_router
 from app.services.watchdog_service import watchdog_loop
@@ -40,15 +41,28 @@ app = FastAPI(
 # Set all CORS enabled origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, set this to frontend URL
+    allow_origins=settings.allowed_origins_list,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
-app.include_router(api_router, prefix=settings.API_V1_STR)
+# Router-level auth: nothing under API_V1_STR is reachable without a valid
+# Supabase bearer token, including any route added here in the future.
+app.include_router(
+    api_router,
+    prefix=settings.API_V1_STR,
+    dependencies=[Depends(get_current_user_id)],
+)
 
 
+# Unauthenticated on purpose — the Render keep-alive pinger and the
+# frontend's cold-start wake-up hit these before a user is signed in.
 @app.get("/")
 def root():
     return {"message": "Welcome to Lynki Backend API"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}

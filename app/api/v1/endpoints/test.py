@@ -4,10 +4,11 @@ Test endpoints — simple quiz flow: generate test, submit answers, get pass cha
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
+from app.core.auth import get_current_user_id
 from app.services.test_service import generate_test, process_test_answer, get_pass_chance, get_test_history, complete_test_session, resume_test
 
 router = APIRouter()
@@ -114,11 +115,13 @@ class CompleteTestResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 @router.get("/{user_id}/{course_id}", response_model=TestResponse)
-async def get_test(user_id: str, course_id: str):
+async def get_test(user_id: str, course_id: str, caller: str = Depends(get_current_user_id)):
     """
     Generate a test for a course. Returns one question per concept,
     avoiding recently-answered questions where possible.
     """
+    if user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         result = await generate_test(user_id, course_id)
         return result
@@ -127,11 +130,13 @@ async def get_test(user_id: str, course_id: str):
 
 
 @router.get("/resume/{user_id}/{session_id}", response_model=TestResponse)
-async def resume_test_endpoint(user_id: str, session_id: str):
+async def resume_test_endpoint(user_id: str, session_id: str, caller: str = Depends(get_current_user_id)):
     """
     Resume an in-progress test session. Returns the full question set
     plus counts of already-answered questions.
     """
+    if user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         result = await resume_test(user_id, session_id)
         return result
@@ -142,10 +147,12 @@ async def resume_test_endpoint(user_id: str, session_id: str):
 
 
 @router.post("/answer", response_model=AnswerResponse)
-async def submit_answer(req: AnswerRequest):
+async def submit_answer(req: AnswerRequest, caller: str = Depends(get_current_user_id)):
     """
     Submit a single answer. Returns correctness feedback + BKT mastery update.
     """
+    if req.user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         result = await process_test_answer(
             user_id=req.user_id,
@@ -162,10 +169,12 @@ async def submit_answer(req: AnswerRequest):
 
 
 @router.get("/pass-chance/{user_id}/{course_id}", response_model=PassChanceResponse)
-async def get_pass_chance_endpoint(user_id: str, course_id: str):
+async def get_pass_chance_endpoint(user_id: str, course_id: str, caller: str = Depends(get_current_user_id)):
     """
     Get the current estimated passing chance for a user in a course.
     """
+    if user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         result = await get_pass_chance(user_id, course_id)
         return result
@@ -174,10 +183,12 @@ async def get_pass_chance_endpoint(user_id: str, course_id: str):
 
 
 @router.get("/history/{user_id}/{course_id}", response_model=TestHistoryResponse)
-async def get_test_history_endpoint(user_id: str, course_id: str):
+async def get_test_history_endpoint(user_id: str, course_id: str, caller: str = Depends(get_current_user_id)):
     """
     Get quiz history for a user in a course (most recent first).
     """
+    if user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         sessions = await get_test_history(user_id, course_id)
         return {"sessions": sessions, "total": len(sessions)}
@@ -186,11 +197,13 @@ async def get_test_history_endpoint(user_id: str, course_id: str):
 
 
 @router.post("/complete", response_model=CompleteTestResponse)
-async def complete_test_endpoint(req: CompleteTestRequest):
+async def complete_test_endpoint(req: CompleteTestRequest, caller: str = Depends(get_current_user_id)):
     """
     Explicitly mark a test session as completed.
     Records the final pass chance.
     """
+    if req.user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         result = await complete_test_session(
             user_id=req.user_id,
