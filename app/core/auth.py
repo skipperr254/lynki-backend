@@ -25,7 +25,7 @@ def get_jwk_client() -> jwt.PyJWKClient:
     return jwt.PyJWKClient(f"{settings.SUPABASE_URL}/auth/v1/.well-known/jwks.json")
 
 
-def get_current_user_id(
+async def get_current_user_id(
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> str:
     """
