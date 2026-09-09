@@ -47,8 +47,13 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-# Router-level auth: nothing in `api_router` is reachable without a valid
+# Router-level auth: nothing under API_V1_STR is reachable without a valid
 # Supabase bearer token, including any route added here in the future.
+app.include_router(
+    api_router,
+    prefix=settings.API_V1_STR,
+    dependencies=[Depends(get_current_user_id)],
+)
 
 
 # Unauthenticated on purpose — the Render keep-alive pinger and the
