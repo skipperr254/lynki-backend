@@ -25,13 +25,19 @@ def get_jwk_client() -> jwt.PyJWKClient:
     return jwt.PyJWKClient(f"{settings.SUPABASE_URL}/auth/v1/.well-known/jwks.json")
 
 
-async def get_current_user_id(
+def get_current_user_id(
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> str:
     """
     Verify the Supabase-issued bearer token and return the caller's user id
     (the token's `sub` claim). Identity always comes from the verified token,
     never from a request body or path parameter.
+
+    Deliberately sync, not async: get_jwk_client() can make a blocking HTTP
+    call on a cache miss (first request, or after key rotation), and jwt.decode
+    itself is blocking CPU work. As `async def` this would stall the event
+    loop with no `await` point to yield at; FastAPI runs a sync dependency
+    like this in the threadpool instead.
     """
     if creds is None:
         raise HTTPException(status_code=401, detail="Missing bearer token")
