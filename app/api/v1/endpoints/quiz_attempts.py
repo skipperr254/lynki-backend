@@ -7,8 +7,9 @@ POST /quiz-attempts/complete    — explicitly complete an attempt
 GET  /quiz-attempts/resume/{user_id}/{attempt_id} — resume in-progress attempt
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from app.core.auth import get_current_user_id
 from app.services.quiz_attempts_service import (
     start_quiz_attempt,
     resume_quiz_attempt,
@@ -42,7 +43,9 @@ class CompleteAttemptRequest(BaseModel):
 
 
 @router.post("/start")
-async def start_attempt(req: StartAttemptRequest):
+async def start_attempt(req: StartAttemptRequest, caller: str = Depends(get_current_user_id)):
+    if req.user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         return await start_quiz_attempt(
             user_id=req.user_id,
@@ -57,7 +60,9 @@ async def start_attempt(req: StartAttemptRequest):
 
 
 @router.post("/answer")
-async def answer_question(req: AnswerRequest):
+async def answer_question(req: AnswerRequest, caller: str = Depends(get_current_user_id)):
+    if req.user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         return await process_quiz_answer(
             user_id=req.user_id,
@@ -74,7 +79,9 @@ async def answer_question(req: AnswerRequest):
 
 
 @router.post("/complete")
-async def complete_attempt(req: CompleteAttemptRequest):
+async def complete_attempt(req: CompleteAttemptRequest, caller: str = Depends(get_current_user_id)):
+    if req.user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         return await complete_quiz_attempt(
             user_id=req.user_id,
@@ -87,7 +94,9 @@ async def complete_attempt(req: CompleteAttemptRequest):
 
 
 @router.get("/resume/{user_id}/{attempt_id}")
-async def resume_attempt(user_id: str, attempt_id: str):
+async def resume_attempt(user_id: str, attempt_id: str, caller: str = Depends(get_current_user_id)):
+    if user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         return await resume_quiz_attempt(user_id=user_id, quiz_attempt_id=attempt_id)
     except ValueError as e:

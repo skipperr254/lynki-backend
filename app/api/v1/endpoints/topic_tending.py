@@ -6,9 +6,11 @@ Endpoint overview:
   POST /topic-tending/evaluate-recall → evaluate student's active-recall text
   POST /topic-tending/complete        → compute BKT mastery delta, mark session done
 
-Auth: this app does not currently use JWT middleware on individual routes
-(the service role key is used server-side for all Supabase calls).
-User identity comes from the request body (same pattern as study_plan, topic_quiz).
+Auth: every route requires a verified Supabase bearer token
+(see app/core/auth.py, applied at the router level in app/main.py).
+/generate carries user_id in its body and is checked directly against the
+caller. /evaluate-recall and /complete carry only session_id, so ownership
+is checked by loading the session row first.
 
 Erik fills in the Claude prompt logic for /generate and /evaluate-recall via PR.
 Peter owns /complete (BKT integration).
@@ -20,8 +22,9 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from app.core.auth import get_current_user_id
 from app.core.supabase import get_supabase
 from app.core.async_db import run_db_operation
 from app.schemas.topic_tending import (
@@ -43,6 +46,27 @@ _supabase = get_supabase()
 
 
 # ─── Internal helpers ──────────────────────────────────────────────────────────
+
+
+async def _load_session_for_owner(session_id: str, caller: str) -> Dict[str, Any]:
+    """
+    topic_tending_sessions carries no user_id in the /evaluate-recall request
+    body — only session_id — so ownership has to be checked by loading the
+    row. Returns the session dict (callers that need it can reuse it).
+    """
+    resp = await run_db_operation(
+        lambda: _supabase.table("topic_tending_sessions")
+        .select("*")
+        .eq("id", session_id)
+        .maybe_single()
+        .execute()
+    )
+    session = getattr(resp, "data", None)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session["user_id"] != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
+    return session
 
 
 async def _get_topic_mastery(user_id: str, course_id: str, topic_id: str) -> float:
@@ -136,12 +160,14 @@ async def _get_kc_breakdown_for_topic(
 
 
 @router.post("/generate", response_model=GenerateResponsePayload)
-async def generate_tending_session(req: GenerateRequest):
+async def generate_tending_session(req: GenerateRequest, caller: str = Depends(get_current_user_id)):
     """
     Fetch BKT mastery + topic content, call Sonnet 4.6 to
     generate recall cards, mnemonics, active-recall prompt, concept pairs.
     Insert a row into topic_tending_sessions and return the generated payload.
     """
+    if req.user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         service = TendingService()
         return await service.generate_session(req.user_id, req.course_id, req.topic_id)
@@ -154,13 +180,14 @@ async def generate_tending_session(req: GenerateRequest):
 
 
 @router.post("/evaluate-recall", response_model=EvaluateRecallResponse)
-async def evaluate_recall(req: EvaluateRecallRequest):
+async def evaluate_recall(req: EvaluateRecallRequest, caller: str = Depends(get_current_user_id)):
     """
     Look up the source_paragraph from generated_content,
     call Sonnet 4.6 to compare student_response against it.
     Return matched concepts (got_right) and missed concepts plus source_paragraph.
     Persist to active_recall_input and active_recall_evaluation columns.
     """
+    await _load_session_for_owner(req.session_id, caller)
     try:
         service = TendingService()
         result = await service.evaluate_recall(req.session_id, req.student_response)
@@ -183,7 +210,7 @@ async def evaluate_recall(req: EvaluateRecallRequest):
 
 
 @router.post("/complete", response_model=CompleteResponse)
-async def complete_session(req: CompleteRequest):
+async def complete_session(req: CompleteRequest, caller: str = Depends(get_current_user_id)):
     """
     Finalize a tending session:
       1. Load the session row (verify it exists and isn't already completed).
@@ -208,6 +235,9 @@ async def complete_session(req: CompleteRequest):
 
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    if session["user_id"] != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
 
     if session.get("completed_at"):
         raise HTTPException(status_code=400, detail="Session already completed")

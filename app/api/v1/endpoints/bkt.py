@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
 
+from app.core.auth import get_current_user_id
 from app.schemas.bkt import (
     BKTSummaryResponse,
     BKTSessionResponse,
@@ -25,12 +26,15 @@ async def get_session(
     course_id: str,
     topic_id: Optional[str] = Query(None, description="Scope session to a specific topic"),
     concept_ids: Optional[str] = Query(None, description="Comma-separated concept UUIDs for a targeted session"),
+    caller: str = Depends(get_current_user_id),
 ):
     """
     Get an adaptive study session for a course.
     Returns questions selected via weighted random from unmastered concepts.
     Priority: concept_ids > topic_id > whole course.
     """
+    if user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         concept_id_list = (
             [c.strip() for c in concept_ids.split(",") if c.strip()]
@@ -49,11 +53,13 @@ async def get_session(
 
 
 @router.post("/answer", response_model=BKTAnswerResponse)
-async def submit_answer(req: BKTAnswerRequest):
+async def submit_answer(req: BKTAnswerRequest, caller: str = Depends(get_current_user_id)):
     """
     Submit a single answer.
     Checks correctness, runs BKT update, records the attempt, returns feedback.
     """
+    if req.user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         result = await BKTService.process_answer(
             user_id=req.user_id,
@@ -71,11 +77,13 @@ async def submit_answer(req: BKTAnswerRequest):
 
 
 @router.get("/progress/{user_id}/{course_id}", response_model=BKTProgressResponse)
-async def get_progress(user_id: str, course_id: str):
+async def get_progress(user_id: str, course_id: str, caller: str = Depends(get_current_user_id)):
     """
     Get full course progress tree: topics -> concepts with BKT mastery values.
     Aggregates across all documents in the course.
     """
+    if user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         return await BKTService.get_course_progress(user_id, course_id)
     except ValueError as e:
@@ -85,8 +93,10 @@ async def get_progress(user_id: str, course_id: str):
 
 
 @router.get("/mastery/{user_id}/{course_id}", response_model=BKTSummaryResponse)
-async def get_mastery(user_id: str, course_id: str):
+async def get_mastery(user_id: str, course_id: str, caller: str = Depends(get_current_user_id)):
     """Get flat skill list + aggregate pass probability for a course."""
+    if user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         return await BKTService.get_mastery_for_course(user_id, course_id)
     except Exception as e:

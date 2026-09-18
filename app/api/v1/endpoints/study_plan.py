@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from app.core.auth import get_current_user_id
 from app.schemas.study_plan import StudyPlanGenerateRequest, StudyPlanGenerateResponse
 from app.services.study_plan_service import generate_study_plan
 
@@ -16,12 +17,16 @@ logger = logging.getLogger(__name__)
 
 
 @router.post("/generate", response_model=StudyPlanGenerateResponse)
-async def generate_study_plan_endpoint(request: StudyPlanGenerateRequest):
+async def generate_study_plan_endpoint(
+    request: StudyPlanGenerateRequest, caller: str = Depends(get_current_user_id)
+):
     """
     Generate (or regenerate) an AI-powered study plan for a user+course pair.
     Fetches BKT mastery data internally, calls Claude Haiku, upserts the
     result into the study_plans table, and returns plan_text + generated_at.
     """
+    if request.user_id != caller:
+        raise HTTPException(status_code=403, detail="Not your data")
     try:
         result = await generate_study_plan(
             user_id=request.user_id,
