@@ -162,7 +162,7 @@ async def _get_kc_breakdown_for_topic(
 @router.post("/generate", response_model=GenerateResponsePayload)
 async def generate_tending_session(req: GenerateRequest, caller: str = Depends(get_current_user_id)):
     """
-    Fetch BKT mastery + topic content, call Sonnet 4.6 to
+    Fetch BKT mastery + topic content, call Sonnet 5 to
     generate recall cards, mnemonics, active-recall prompt, concept pairs.
     Insert a row into topic_tending_sessions and return the generated payload.
     """
@@ -183,7 +183,7 @@ async def generate_tending_session(req: GenerateRequest, caller: str = Depends(g
 async def evaluate_recall(req: EvaluateRecallRequest, caller: str = Depends(get_current_user_id)):
     """
     Look up the source_paragraph from generated_content,
-    call Sonnet 4.6 to compare student_response against it.
+    call Sonnet 5 to compare student_response against it.
     Return matched concepts (got_right) and missed concepts plus source_paragraph.
     Persist to active_recall_input and active_recall_evaluation columns.
     """

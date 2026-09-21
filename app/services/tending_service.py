@@ -26,33 +26,29 @@ OUTPUT FORMAT:
 You must return a valid JSON object with the following structure:
 {
   "recall_cards": {
-    "stage": "recall_cards",
     "cards": [
-      { "id": "uuid", "front": "...", "back": "..." }
+      { "front": "...", "back": "..." }
     ]
   },
   "active_recall": {
-    "stage": "active_recall",
     "prompt": "...",
     "source_paragraph": "..."
   },
   "mnemonics": {
-    "stage": "mnemonics",
     "mnemonics": [
-      { "id": "uuid", "hook": "...", "explanation": "..." }
+      { "hook": "...", "explanation": "..." }
     ]
   },
   "connections": {
-    "stage": "connections",
     "type": "analogy",
     "pairs": [
-      { "id": "uuid", "left": "...", "right": "..." }
+      { "left": "...", "right": "..." }
     ]
   }
 }
 
 Use the provided concept data strictly. Do not hallucinate external facts.
-Keep the IDs as random UUID strings.
+Return only the JSON object, no prose before or after it.
 """
 
 EVALUATION_SYSTEM_PROMPT = """
@@ -94,13 +90,55 @@ def _parse_json_response(response_text: str) -> Dict[str, Any]:
     return json.loads(json_str)
 
 
+def _text_of(response) -> str:
+    """
+    Join the response's text blocks. On Sonnet 5 adaptive thinking is on by
+    default, so `content[0]` can be a ThinkingBlock and `.text` blows up;
+    filtering by block type is correct on every model.
+    """
+    return "".join(b.text for b in response.content if b.type == "text")
+
+
+# (stage key, list key) for each stage whose items carry an id.
+_STAGE_ITEM_LISTS = (
+    ("recall_cards", "cards"),
+    ("mnemonics", "mnemonics"),
+    ("connections", "pairs"),
+)
+
+
+def _finalize_generated_content(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fill in the parts of the payload the model no longer produces: the
+    `stage` discriminator on each stage object and a UUID on every card /
+    mnemonic / pair. The model used to emit these itself, and the 15-odd
+    UUIDs alone were ~25% of the output tokens on a ~40s generation — pure
+    latency for values uuid4() hands out for free. The stored shape is
+    unchanged, so resume/hydrate and the frontend types need no update.
+    """
+    for stage in ("recall_cards", "active_recall", "mnemonics", "connections"):
+        stage_obj = data.get(stage)
+        if isinstance(stage_obj, dict):
+            stage_obj["stage"] = stage
+    for stage, list_key in _STAGE_ITEM_LISTS:
+        items = (data.get(stage) or {}).get(list_key) or []
+        for item in items:
+            if isinstance(item, dict) and not item.get("id"):
+                item["id"] = str(uuid.uuid4())
+    return data
+
+
 class TendingService:
     def __init__(self):
         self.client = AsyncAnthropic(
             api_key=settings.ANTHROPIC_API_KEY,
             max_retries=MAX_API_RETRIES,
         )
-        self.model = "claude-sonnet-4-6"  # or settings.CLAUDE_MODEL
+        # Sonnet 5, not 4.6: measured 2026-09-21 on the same prompt, 4.6 streamed
+        # ~50 tok/s (39-42s per generation) and Sonnet 5 ~110 tok/s (~18s),
+        # and Sonnet 5 is the cheaper of the two. This call is output-bound,
+        # so throughput is the whole story.
+        self.model = "claude-sonnet-5"
 
     async def generate_session(self, user_id: str, course_id: str, topic_id: str) -> Dict[str, Any]:
         db = get_supabase()
@@ -126,7 +164,7 @@ class TendingService:
         )
         concepts = concepts_res.data or []
 
-        concept_context = "\\n".join([f"- {c['name']}: {c['explanation']}" for c in concepts])
+        concept_context = "\n".join([f"- {c['name']}: {c['explanation']}" for c in concepts])
 
         # 3. Call Claude
         try:
@@ -136,13 +174,18 @@ class TendingService:
                     max_tokens=2500,
                     system=TENDING_SYSTEM_PROMPT,
                     messages=[
-                        {"role": "user", "content": f"Topic: {topic_title}\\nConcepts:\\n{concept_context}"}
-                    ]
+                        {"role": "user", "content": f"Topic: {topic_title}\nConcepts:\n{concept_context}"}
+                    ],
+                    # Low effort: this is templated content generation, not
+                    # reasoning. At the default effort Sonnet 5 spends ~350
+                    # tokens thinking before the JSON (15.6s); at low it skips
+                    # straight to output (11.7s) with identical card/pair counts.
+                    output_config={"effort": "low"},
                 ),
                 timeout=GENERATE_TIMEOUT_SECONDS,
             )
-            content = response.content[0].text
-            generated_data = _parse_json_response(content)
+            content = _text_of(response)
+            generated_data = _finalize_generated_content(_parse_json_response(content))
             # Fold the title into generated_content so a later resume (which
             # hydrates straight from this row) doesn't need a topics join.
             generated_data["topic_title"] = topic_title
@@ -215,12 +258,12 @@ class TendingService:
                     max_tokens=1000,
                     system=EVALUATION_SYSTEM_PROMPT,
                     messages=[
-                        {"role": "user", "content": f"Source Paragraph: {source_paragraph}\\nStudent Response: {student_response}"}
+                        {"role": "user", "content": f"Source Paragraph: {source_paragraph}\nStudent Response: {student_response}"}
                     ]
                 ),
                 timeout=EVALUATE_TIMEOUT_SECONDS,
             )
-            content = response.content[0].text
+            content = _text_of(response)
             evaluation = _parse_json_response(content)
         except (asyncio.TimeoutError, APITimeoutError, APIConnectionError) as e:
             logger.error(
