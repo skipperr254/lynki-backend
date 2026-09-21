@@ -66,6 +66,8 @@ Output must be JSON:
   "score": 0.85 
 }
 'score' should be between 0 and 1.
+Each list item is a short phrase of at most 8 words. At most 5 items per list.
+Output only the JSON.
 """
 
 # Wall-clock budgets for the two Claude calls, and a cap on the SDK's own
@@ -233,21 +235,29 @@ class TendingService:
             **generated_data
         }
 
-    async def evaluate_recall(self, session_id: str, student_response: str) -> Dict[str, Any]:
-        db = get_supabase()
-        
-        # 1. Fetch Session for source paragraph
-        session_res = await run_db_operation(
-            lambda: db.table("topic_tending_sessions")
-            .select("generated_content")
-            .eq("id", session_id)
-            .single()
-            .execute()
-        )
-        if not session_res.data:
-            raise ValueError("Session not found")
-        
-        session_data = session_res.data["generated_content"]
+    async def evaluate_recall(
+        self,
+        session_id: str,
+        student_response: str,
+        session: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        # 1. Source paragraph. The endpoint has already loaded this row for
+        # its ownership check, so accept it and skip a second ~400ms round
+        # trip for the same data; only fetch when called without one.
+        if session is None:
+            db = get_supabase()
+            session_res = await run_db_operation(
+                lambda: db.table("topic_tending_sessions")
+                .select("generated_content")
+                .eq("id", session_id)
+                .single()
+                .execute()
+            )
+            if not session_res.data:
+                raise ValueError("Session not found")
+            session = session_res.data
+
+        session_data = session.get("generated_content") or {}
         source_paragraph = session_data.get("active_recall", {}).get("source_paragraph", "")
 
         # 2. Call Claude for evaluation
@@ -259,7 +269,12 @@ class TendingService:
                     system=EVALUATION_SYSTEM_PROMPT,
                     messages=[
                         {"role": "user", "content": f"Source Paragraph: {source_paragraph}\nStudent Response: {student_response}"}
-                    ]
+                    ],
+                    # Low effort: at the default, Sonnet 5 thinks for 150-200
+                    # tokens before grading a 100-word paragraph (4.6-8.3s
+                    # measured); at low it answers directly in ~2.7s with
+                    # comparable got_right/missed lists and scores.
+                    output_config={"effort": "low"},
                 ),
                 timeout=EVALUATE_TIMEOUT_SECONDS,
             )

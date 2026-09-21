@@ -22,7 +22,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
 from app.core.auth import get_current_user_id
 from app.core.supabase import get_supabase
@@ -179,31 +179,51 @@ async def generate_tending_session(req: GenerateRequest, caller: str = Depends(g
 # ─── POST /evaluate-recall ────────────────────────────────────────────────────
 
 
+async def _persist_recall_evaluation(session_id: str, student_response: str, result: Dict[str, Any]) -> None:
+    """
+    Background write for /evaluate-recall. Runs after the response has gone
+    out, so a failure here can't reach the user — and it doesn't need to:
+    /complete writes active_recall_input and active_recall_evaluation again
+    from the client's own copy of the results, so a lost write self-heals.
+    """
+    try:
+        await run_db_operation(
+            lambda: _supabase.table("topic_tending_sessions").update({
+                "active_recall_input": student_response,
+                "active_recall_evaluation": result,
+            }).eq("id", session_id).execute()
+        )
+    except Exception as e:
+        logger.error(f"Failed to persist recall evaluation for session={session_id}: {e}")
+
+
 @router.post("/evaluate-recall", response_model=EvaluateRecallResponse)
-async def evaluate_recall(req: EvaluateRecallRequest, caller: str = Depends(get_current_user_id)):
+async def evaluate_recall(
+    req: EvaluateRecallRequest,
+    background: BackgroundTasks,
+    caller: str = Depends(get_current_user_id),
+):
     """
     Look up the source_paragraph from generated_content,
     call Sonnet 5 to compare student_response against it.
     Return matched concepts (got_right) and missed concepts plus source_paragraph.
     Persist to active_recall_input and active_recall_evaluation columns.
+
+    The user is staring at an "Evaluating…" button for the whole request, so
+    the only thing on the critical path is the Claude call: the ownership
+    read doubles as the content read, and the persist runs after the
+    response is sent.
     """
-    await _load_session_for_owner(req.session_id, caller)
+    session = await _load_session_for_owner(req.session_id, caller)
     try:
         service = TendingService()
-        result = await service.evaluate_recall(req.session_id, req.student_response)
-
-        # Persist to active_recall_input and active_recall_evaluation
-        await run_db_operation(
-            lambda: _supabase.table("topic_tending_sessions").update({
-                "active_recall_input": req.student_response,
-                "active_recall_evaluation": result
-            }).eq("id", req.session_id).execute()
-        )
-
-        return result
+        result = await service.evaluate_recall(req.session_id, req.student_response, session=session)
     except Exception as e:
         logger.error(f"Error evaluating recall: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+    background.add_task(_persist_recall_evaluation, req.session_id, req.student_response, result)
+    return result
 
 
 # ─── POST /complete ───────────────────────────────────────────────────────────
